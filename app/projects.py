@@ -23,8 +23,11 @@ PROJECTS_DIR = BASE_DIR / "data" / "projects"
 REQUIRED_STR_FIELDS = ("name", "script")
 OPTIONAL_FIELDS = {
     "voice_id": str,
+    "engine_id": str,
     "preset_id": str,
     "speed": (int, float),
+    "rate_pct": int,
+    "pitch_pct": int,
     "pause_sentence_sec": (int, float),
     "pause_chunk_sec": (int, float),
     "pause_paragraph_sec": (int, float),
@@ -65,6 +68,12 @@ def validate_project_dict(d: object) -> tuple[dict | None, list[str]]:
             errors.append(f"'{f}' ০–৩ সেকেন্ডের মধ্যে হতে হবে।")
     if isinstance(d.get("voice_gain"), (int, float)) and not 0.5 <= d["voice_gain"] <= 1.5:
         errors.append("ভয়েস গেইন ০.৫–১.৫ এর মধ্যে হতে হবে।")
+    if isinstance(d.get("rate_pct"), int) and not -50 <= d["rate_pct"] <= 50:
+        errors.append("গতির শতাংশ -৫০ থেকে +৫০ এর মধ্যে হতে হবে।")
+    if isinstance(d.get("pitch_pct"), int) and not -20 <= d["pitch_pct"] <= 20:
+        errors.append("পিচের শতাংশ -২০ থেকে +২০ এর মধ্যে হতে হবে।")
+    if isinstance(d.get("engine_id"), str) and d["engine_id"] not in ("edge", "tiny"):
+        errors.append("ইঞ্জিন edge বা tiny হতে হবে।")
     if isinstance(d.get("emo_overrides"), dict):
         for k, v in d["emo_overrides"].items():
             if not isinstance(v, list) or any(t not in ALL_TAGS for t in v):
@@ -76,9 +85,14 @@ def validate_project_dict(d: object) -> tuple[dict | None, list[str]]:
         "id": d.get("id") if isinstance(d.get("id"), str) and d["id"] else new_project_id(),
         "name": d["name"].strip(),
         "script": d["script"],
-        "voice_id": d.get("voice_id", "tiny-female"),
+        "voice_id": d.get("voice_id", "edge-pradeep"),
+        # Old projects (v2/v3) have no engine_id: infer it from the voice.
+        "engine_id": d.get("engine_id") or (
+            "edge" if str(d.get("voice_id", "")).startswith("edge-") else "tiny"),
         "preset_id": d.get("preset_id", "none"),
         "speed": float(d.get("speed", 1.0)),
+        "rate_pct": int(d.get("rate_pct", 0)),
+        "pitch_pct": int(d.get("pitch_pct", 0)),
         "pause_sentence_sec": float(d.get("pause_sentence_sec", 0.3)),
         "pause_chunk_sec": float(d.get("pause_chunk_sec", 0.35)),
         "pause_paragraph_sec": float(d.get("pause_paragraph_sec", 0.5)),
