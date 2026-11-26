@@ -1,31 +1,39 @@
-"""BANGLA VOICE AI — Streamlit Community Cloud সংস্করণ v2.
+"""BANGLA VOICE AI — Streamlit Community Cloud সংস্করণ v3.
 
-v1-এর স্টুডিও অপরিবর্তিত রেখে বাকি ফিচার যোগ করা হয়েছে:
-- ট্যাব: স্টুডিও / ভয়েস লাইব্রেরি / কাস্টম ভয়েস / আমার প্রজেক্ট / অ্যাডমিন
-- ভয়েস লাইব্রেরি (আসল কণ্ঠ + নমুনা, Parler/IndicF5 অনুপলব্ধ বলে দেওয়া)
-- কাস্টম ভয়েস স্টুডিও (নমুনা-মাত্র প্রোফাইল — কোনো ক্লোনিং নয়)
-- প্রজেক্ট (data/projects/*.json + ডাউনলোড/আপলোড — সার্ভারে স্থায়ী নয়)
-- অ্যাডমিন (ইঞ্জিন, CPU/RAM, পরিসংখ্যান, কণ্ঠ চালু/বন্ধ)
-- ভয়েস সেটিংস (গতি, বাক্যের বিরতি, চাঙ্কের বিরতি — শুধু Tiny যা পারে)
-- অডিও স্টুডিও (ওয়েভফর্ম, সেগমেন্ট প্লেয়ার + ডাউনলোড)
-- স্বয়ংক্রিয় আবেগ (app/emotion.py-র আসল detect) + নরমালাইজেশন প্রিভিউ
+v2-এর সব ফিচার অপরিবর্তিত + v3:
+- 🎵 মিউজিক স্টুডিও (নতুন ট্যাব): নিজের মিউজিক আপলোড (WAV/MP3) বা
+  অ্যাপে সিনথেসাইজ করা আবহ সঙ্গীত (প্যাড/ড্রোন/বৃষ্টি) — মিক্স, ফেড
+  ইন/আউট, ডাকিং, ভয়েস-মাত্র ও ভয়েস+মিউজিক এক্সপোর্ট (WAV/MP3)
+- ভয়েস কন্ট্রোল: গতি ০.৭৫–১.৫×, বাক্যের বিরতি, অনুচ্ছেদের বিরতি
+  (আসল), ভয়েস গেইন (ক্লিপিং-গার্ডসহ)
+- ভয়েস প্রোফাইল: আসল ২ কণ্ঠ + আসল সেটিংসের সমন্বয় (আলাদা কণ্ঠ নয়)
+- ব্রাউজার ভয়েস প্রিভিউ (ডিভাইসের SpeechSynthesis — শুধু শোনার জন্য)
+- ইঞ্জিন রেজিস্ট্রি (app.engines): নতুন ইঞ্জিন register_engine() দিয়ে
+  যোগ করা যায়; Parler/IndicF5 অনুপলব্ধ হিসেবে তালিকায় আছে
 
-সীমা (v1-এর মতোই): ১ GB RAM, lazy-load মডেল, ffmpeg নেই, transformers নেই,
-Parler/IndicF5 নেই। যা Tiny পারে না, তা অনুপলব্ধ বলে দেখানো হয় — নকল নয়।
+ইঞ্জিন এখনো Indic Tiny TTS-ই (২ কণ্ঠ)। নতুন কোনো TTS ইঞ্জিন যোগ করা
+হয়নি — কণ্ঠের সিদ্ধান্ত এখনো খোলা। সীমা: ১ GB RAM, ffmpeg নেই,
+transformers নেই, পিচ/আবেগ নিয়ন্ত্রণ TinyTTS সমর্থন করে না।
 """
 import hashlib
 import json
 from pathlib import Path
 
+import numpy as np
 import streamlit as st
 
+from app.audio_lite import mp3_bytes, wav_bytes, wav_bytes_to_samples
+from app.browser_voice import browser_preview_html
 from app.chunker import chunk_text, split_sentences
 from app.config import settings
 from app.custom_voices import new_profile, profile_to_json, validate_sample
 from app.emotion import ALL_TAGS, TAG_BN, detect
-from app.engines import get_engine
+from app.engines import get_engine, list_engines
 from app.generate import generate_audio
-from app.presets import PRESETS, get_preset
+from app.music import (AMBIENCE_KINDS, decode_audio_bytes,
+                       mix_voice_music, synthesize_ambience, validate_music)
+from app.presets import (PRESETS, VOICE_PROFILES, get_preset,
+                         get_voice_profile)
 from app.projects import (delete_project, list_projects, load_project,
                           new_project_id, project_from_bytes,
                           project_to_bytes, projects_disk_usage,
@@ -74,6 +82,21 @@ def _on_preset_change():
     st.session_state["pause_chunk_sec"] = preset["pause_sec"]
 
 
+def _on_profile_change():
+    """Apply a voice profile: real voice + real settings (never a fake voice)."""
+    prof = get_voice_profile(st.session_state.get("voice_profile_id", "none"))
+    if prof["voice_id"]:
+        st.session_state["voice_id"] = prof["voice_id"]
+    if prof["speed"] is not None:
+        st.session_state["speed"] = prof["speed"]
+    if prof["pause_sentence_sec"] is not None:
+        st.session_state["pause_sentence_sec"] = prof["pause_sentence_sec"]
+    if prof["pause_chunk_sec"] is not None:
+        st.session_state["pause_chunk_sec"] = prof["pause_chunk_sec"]
+    if prof["voice_gain"] is not None:
+        st.session_state["voice_gain"] = prof["voice_gain"]
+
+
 def fmt_duration(sec: float) -> str:
     sec = max(0.0, float(sec))
     m, s = divmod(int(round(sec)), 60)
@@ -86,11 +109,16 @@ def _init_state():
         "speed": 1.0,
         "pause_sentence_sec": 0.3,
         "pause_chunk_sec": 0.35,
+        "pause_paragraph_sec": 0.5,
+        "voice_gain": 1.0,
+        "voice_profile_id": "none",
         "auto_emotion": True,
         "emo_overrides": {},
         "sentence_emotions": {},
         "last_result": None,
         "custom_voices": [],
+        "music": None,
+        "music_mix": None,
         "toggle_tiny-female": True,
         "toggle_tiny-male": True,
         "toggle_custom-rahat-narrator": True,
@@ -126,6 +154,7 @@ def record_stats(result: dict):
 
 def run_generation(text: str, voice_id: str, speed: float, preset: dict,
                    pause_sentence_sec: float, pause_chunk_sec: float,
+                   pause_paragraph_sec: float, voice_gain: float,
                    sentence_emotions: dict | None,
                    progress_cb) -> dict:
     """Generate + record stats + stash result. Raises on total failure."""
@@ -133,6 +162,8 @@ def run_generation(text: str, voice_id: str, speed: float, preset: dict,
         text, voice_id, speed, preset, progress_cb,
         pause_sentence_sec=pause_sentence_sec,
         pause_chunk_sec=pause_chunk_sec,
+        pause_paragraph_sec=pause_paragraph_sec,
+        voice_gain=voice_gain,
         sentence_emotions=sentence_emotions,
         engine=get_tiny_engine())
     record_stats(result)
@@ -240,7 +271,7 @@ _init_state()
 
 st.title("🎙️ বাংলা ভয়েস AI")
 st.caption("The Ultimate Bengali AI Voice Studio — ফ্রি, সেলফ-হোস্টেড সংস্করণ "
-           "(Streamlit Cloud) · v2")
+           "(Streamlit Cloud) · v3")
 
 # ---------------------------------------------------------- সাইডবার ---
 with st.sidebar:
@@ -272,6 +303,19 @@ with st.sidebar:
                    else "সময়কাল জানা যায়নি")
             st.caption(f"{prof['name']} · {dur} · {prof['filename']}")
 
+    st.header("🎭 ভয়েস প্রোফাইল")
+    prof_id = st.selectbox(
+        "প্রোফাইল (সেটিংসের সমন্বয়)", options=[p["id"] for p in VOICE_PROFILES],
+        format_func=lambda pid: get_voice_profile(pid)["name"],
+        key="voice_profile_id", on_change=_on_profile_change,
+        help="প্রোফাইল আলাদা কণ্ঠ নয় — এটি একটি আসল কণ্ঠ (নারী/পুরুষ) "
+             "+ গতি ও বিরতির সমন্বয়। বেছে নিলে কণ্ঠ ও সেটিংস একসাথে "
+             "বদলে যাবে।")
+    prof = get_voice_profile(prof_id)
+    st.caption(prof["desc"])
+    st.caption("প্রোফাইল = সেটিংসের সমন্বয় — কণ্ঠ সবসময় ২টি আসল কণ্ঠের "
+               "একটি (নারী/পুরুষ)। আলাদা কণ্ঠ বলে কিছু দেখানো হয় না।")
+
     st.header("ডকুমেন্টারি মোড")
     preset_id = st.selectbox(
         "প্রিসেট", options=[p["id"] for p in PRESETS],
@@ -285,9 +329,9 @@ with st.sidebar:
                    + " — বাক্যের আগে লিখলে টোনের ইঙ্গিত মিলবে।")
 
     st.header("ভয়েস সেটিংস")
-    speed = st.slider("গতি সমন্বয়", 0.7, 1.3, step=0.05, key="speed",
-                      help="প্রিসেটের গতির উপর এই সমন্বয় প্রয়োগ হবে। "
-                           "১.০ = স্বাভাবিক গতি।")
+    speed = st.slider("গতি সমন্বয়", 0.75, 1.5, step=0.05, key="speed",
+                      help="কথা বলার গতি — ০.৭৫× ধীর, ১.৫× দ্রুত। "
+                           "প্রিসেট বা প্রোফাইল বদলালে এটি তাদের মানে ফিরে যায়।")
     st.caption(f"কার্যকর গতি: {speed}×")
     pause_sentence = st.slider(
         "বাক্যের মাঝে বিরতি (সেকেন্ড)", 0.0, 1.5, step=0.05,
@@ -299,13 +343,27 @@ with st.sidebar:
         key="pause_chunk_sec",
         help="লম্বা স্ক্রিপ্টের চাঙ্কগুলোর মাঝের বিরতি। প্রিসেট বদলালে "
              "এটি প্রিসেটের মানে ফিরে যায়।")
+    pause_para = st.slider(
+        "অনুচ্ছেদের মাঝে বিরতি (সেকেন্ড)", 0.0, 3.0, step=0.1,
+        key="pause_paragraph_sec",
+        help="দুটি অনুচ্ছেদের (প্যারাগ্রাফের) মাঝে এই বিরতি যোগ হবে — "
+             "স্ক্রিপ্টে নতুন লাইনে লেখা অনুচ্ছেদের সীমানায় প্রযোজ্য। "
+             "এটি আসল নীরবতা, শুধু লেবেল নয়।")
+    voice_gain = st.slider(
+        "ভয়েস গেইন (ভলিউম)", 0.5, 1.5, step=0.05, key="voice_gain",
+        help="তৈরি অডিওর ভলিউম — ১.০ = স্বাভাবিক। বেশি গেইনে ক্লিপিং "
+             "হলে স্বয়ংক্রিয়ভাবে কমিয়ে peak ০.৯৮-এ রাখা হবে "
+             "(সতর্কবার্তাসহ)।")
     if st.button("⚙️ সেটিংস ডিফল্টে ফেরান"):
         st.session_state["speed"] = 1.0
         st.session_state["pause_sentence_sec"] = 0.3
         st.session_state["pause_chunk_sec"] = preset["pause_sec"]
+        st.session_state["pause_paragraph_sec"] = 0.5
+        st.session_state["voice_gain"] = 1.0
+        st.session_state["voice_profile_id"] = "none"
         st.rerun()
-    st.caption("পিচ / স্থিতিশীলতা / সাদৃশ্য — TinyTTS এগুলো সমর্থন করে "
-               "না, তাই এখানে দেখানো হয়নি।")
+    st.caption("পিচ / আবেগের তীব্রতা — TinyTTS এগুলো সমর্থন করে না, তাই "
+               "এখানে দেখানো হয়নি। গতি ও বিরতি দিয়েই টোনের ইঙ্গিত দেওয়া হয়।")
 
     with st.expander("ℹ️ ইঞ্জিন সম্পর্কে (সত্য কথা)"):
         st.write("**চলমান ইঞ্জিন:** Indic Tiny TTS (Bengali) — আসল নিউরাল "
@@ -328,9 +386,9 @@ with st.sidebar:
                  "অডিও শোনা যায়।")
 
 # ------------------------------------------------------------- ট্যাব ---
-tab_studio, tab_library, tab_custom, tab_projects, tab_admin = st.tabs([
+tab_studio, tab_library, tab_custom, tab_projects, tab_music, tab_admin = st.tabs([
     "🎙️ স্টুডিও", "🎤 ভয়েস লাইব্রেরি", "🎧 কাস্টম ভয়েস",
-    "📁 আমার প্রজেক্ট", "⚙️ অ্যাডমিন",
+    "📁 আমার প্রজেক্ট", "🎵 মিউজিক স্টুডিও", "⚙️ অ্যাডমিন",
 ])
 
 # ============================================================ স্টুডিও ===
@@ -442,6 +500,8 @@ with tab_studio:
                         text, voice_id, speed, preset,
                         st.session_state["pause_sentence_sec"],
                         st.session_state["pause_chunk_sec"],
+                        st.session_state["pause_paragraph_sec"],
+                        st.session_state["voice_gain"],
                         st.session_state.get("sentence_emotions") or None,
                         lambda f, msg: (bar.progress(f, text=msg),
                                         status.write(msg)))
@@ -449,6 +509,17 @@ with tab_studio:
             except Exception as e:  # noqa: BLE001 — ব্যবহারকারীকে সরল ভাষায় জানানো
                 bar.empty()
                 st.error(f"ভয়েস তৈরি হয়নি: {e}")
+
+    # ------------------------------------------- ব্রাউজার ভয়েস প্রিভিউ ---
+    st.subheader("🔊 ব্রাউজার প্রিভিউ (শুধু শোনার জন্য)")
+    st.caption("এটি আপনার ডিভাইসের (ফোন/কম্পিউটার) নিজের বাংলা ভয়েসে "
+               "শোনাবে — অ্যাপের আসল TinyTTS কণ্ঠ নয়, আর ডাউনলোড করা যায় "
+               "না। ডিভাইসে বাংলা ভয়েস না থাকলে কাজ করবে না। স্ক্রিপ্ট "
+               "কেমন শোনাবে তার দ্রুত ধারণা নেওয়ার জন্য।")
+    import streamlit.components.v1 as components  # noqa: PLC0415
+    components.html(
+        browser_preview_html(text, rate=float(speed)),
+        height=150)
 
     # ----------------------------------------------------------- ফলাফল ---
     result = st.session_state.get("last_result")
@@ -661,6 +732,8 @@ with tab_projects:
                 "speed": st.session_state.get("speed", 1.0),
                 "pause_sentence_sec": st.session_state.get("pause_sentence_sec", 0.3),
                 "pause_chunk_sec": st.session_state.get("pause_chunk_sec", 0.35),
+                "pause_paragraph_sec": st.session_state.get("pause_paragraph_sec", 0.5),
+                "voice_gain": st.session_state.get("voice_gain", 1.0),
                 "auto_emotion": st.session_state.get("auto_emotion", True),
                 "emo_overrides": st.session_state.get("emo_overrides", {}),
             }
@@ -720,6 +793,8 @@ with tab_projects:
                     st.session_state["speed"] = p["speed"]
                     st.session_state["pause_sentence_sec"] = p["pause_sentence_sec"]
                     st.session_state["pause_chunk_sec"] = p["pause_chunk_sec"]
+                    st.session_state["pause_paragraph_sec"] = p.get("pause_paragraph_sec", 0.5)
+                    st.session_state["voice_gain"] = p.get("voice_gain", 1.0)
                     st.session_state["auto_emotion"] = p["auto_emotion"]
                     st.session_state["emo_overrides"] = dict(p.get("emo_overrides", {}))
                     st.session_state["selected_project_id"] = pid
@@ -739,6 +814,8 @@ with tab_projects:
                                     get_preset(p["preset_id"]),
                                     p["pause_sentence_sec"],
                                     p["pause_chunk_sec"],
+                                    p.get("pause_paragraph_sec", 0.5),
+                                    p.get("voice_gain", 1.0),
                                     p.get("emo_overrides") or None,
                                     lambda f, msg: bar.progress(f, text=msg))
                             st.session_state["selected_project_id"] = pid
@@ -800,6 +877,196 @@ with tab_projects:
                 st.caption(f"সর্বশেষ তৈরি: {pa['created_at']} · "
                            f"{fmt_duration(pa['duration_sec'])}")
 
+# ================================================= মিউজিক স্টুডিও ===
+with tab_music:
+    st.header("🎵 মিউজিক স্টুডিও")
+    st.caption("ব্যাকগ্রাউন্ড মিউজিক মিক্স করুন — নিজের মিউজিক আপলোড করুন "
+               "অথবা অ্যাপে সিনথেসাইজ করা আবহ সঙ্গীত ব্যবহার করুন। কোনো "
+               "কপিরাইটযুক্ত গান ডাউনলোড করা হয় না; আপলোড করা ফাইল ও "
+               "সিনথেসাইজ করা আবহ শুধু এই সেশনে থাকে।")
+
+    # ---- ১. মিউজিক বেছে নিন ----
+    st.subheader("১. ব্যাকগ্রাউন্ড মিউজিক বেছে নিন")
+    music_source = st.radio(
+        "মিউজিকের উৎস",
+        ["আপলোড করা মিউজিক", "সিনথেসাইজ করা আবহ সঙ্গীত"],
+        key="music_source", horizontal=True)
+    music = st.session_state.get("music")
+
+    if music_source == "আপলোড করা মিউজিক":
+        st.caption("নিজের মিউজিক ফাইল আপলোড করুন (WAV/MP3, সর্বোচ্চ "
+                   "25 MB, ৩–৬০০ সেকেন্ড)। শুধু আপনার নিজের বা বৈধভাবে "
+                   "ব্যবহারযোগ্য অডিও আপলোড করবেন।")
+        up = st.file_uploader("মিউজিক ফাইল বেছে নিন", type=["wav", "mp3"],
+                              key="music_upload")
+        if up is not None:
+            data = up.read()
+            val = validate_music(up.name, data)
+            m1, m2, m3 = st.columns(3)
+            m1.metric("ফরম্যাট", val["format"].upper() if val["format"] else "—")
+            m2.metric("সময়কাল",
+                      f"{val['duration_sec']} সে" if val["duration_sec"] else "—")
+            m3.metric("আকার", f"{val['size_bytes'] / 1024:.0f} KB")
+            if val["rms"] is not None:
+                st.write(f"**RMS:** {val['rms']} · **Peak:** {val['peak']} · "
+                         f"**নীরবতা:** {val['silence_frac'] * 100:.0f}%")
+            for issue in val["issues"]:
+                st.error(f"❌ {issue}")
+            for warn in val["warnings"]:
+                st.warning(f"⚠️ {warn}")
+            if val["ok"]:
+                arr, info = decode_audio_bytes(data, up.name)
+                st.audio(wav_bytes(arr, 24000), format="audio/wav")
+                st.caption("প্রিভিউ: আপলোড করা ফাইলটি ২৪ kHz মোনোতে "
+                           "রূপান্তরিত — মিক্সে ঠিক এটাই ব্যবহার হবে।")
+                if st.button("🎵 এই মিউজিক ব্যবহার করুন"):
+                    st.session_state["music"] = {
+                        "name": up.name, "samples": arr,
+                        "duration_sec": info["duration_sec"],
+                        "source": "upload"}
+                    st.session_state["music_mix"] = None
+                    st.success(f"'{up.name}' মিউজিক হিসেবে বেছে নেওয়া হয়েছে।")
+                    st.rerun()
+    else:
+        st.caption("অ্যাপ নিজে numpy দিয়ে আবহ সঙ্গীত তৈরি করে — এগুলো "
+                   "মূল সুর, কোনো গান বা রেকর্ডিং নয়, কপিরাইটমুক্ত।")
+        kind_id = st.selectbox(
+            "আবহ সঙ্গীত", options=[k["id"] for k in AMBIENCE_KINDS],
+            format_func=lambda kid: next(
+                k["name"] for k in AMBIENCE_KINDS if k["id"] == kid),
+            key="ambience_kind")
+        kind = next(k for k in AMBIENCE_KINDS if k["id"] == kind_id)
+        st.caption(kind["desc"])
+        amb_sec = st.slider("আবহের দৈর্ঘ্য (সেকেন্ড)", 10, 120, 30,
+                            key="ambience_sec",
+                            help="আবহটি লুপ হিসেবে চলবে — ন্যারেশন যত লম্বাই "
+                                 "হোক, আবহটি বারবার চলবে।")
+        if st.button("🎵 আবহ তৈরি করুন"):
+            arr = synthesize_ambience(kind_id, amb_sec)
+            st.session_state["music"] = {
+                "name": f"{kind['name']} ({amb_sec} সে)",
+                "samples": arr, "duration_sec": float(amb_sec),
+                "source": "ambience"}
+            st.session_state["music_mix"] = None
+            st.success("আবহ সঙ্গীত তৈরি হয়েছে।")
+            st.rerun()
+
+    if music is not None:
+        with st.container(border=True):
+            st.write(f"**বর্তমান মিউজিক:** {music['name']} · "
+                     f"{music['duration_sec']} সে · "
+                     f"উৎস: {'আপলোড' if music['source'] == 'upload' else 'সিনথেসাইজ করা আবহ'}")
+            st.audio(wav_bytes(music["samples"], 24000), format="audio/wav")
+            if st.button("🗑️ মিউজিক বাদ দিন"):
+                st.session_state["music"] = None
+                st.session_state["music_mix"] = None
+                st.rerun()
+
+    # ---- ২. মিক্সের সেটিংস ----
+    st.subheader("২. মিক্সের সেটিংস")
+    mix_voice_vol = st.slider("কণ্ঠের ভলিউম (মিক্সে)", 0.0, 1.5, 1.0,
+                              step=0.05, key="mix_voice_vol",
+                              help="মিক্সে কণ্ঠের ভলিউম — ১.০ = স্বাভাবিক।")
+    mix_music_vol = st.slider("মিউজিকের ভলিউম", 0.0, 1.0, 0.4, step=0.05,
+                              key="mix_music_vol",
+                              help="মিউজিকের ভলিউম — ব্যাকগ্রাউন্ডে হালকা "
+                                   "রাখাই ভালো (০.৩–০.৫)।")
+    mix_balance = st.slider("কণ্ঠ/মিউজিক ব্যালান্স", 0, 100, 50,
+                            key="mix_balance",
+                            help="০ = কণ্ঠ জোরালো (মিউজিক ×০.৩), ৫০ = সমান, "
+                                 "১০০ = মিউজিক জোরালো (কণ্ঠ ×০.৬)।")
+    mix_fade_in = st.slider("ফেড ইন (সেকেন্ড)", 0.0, 5.0, 1.0, step=0.5,
+                            key="mix_fade_in",
+                            help="শুরুতে মিক্সটি ধীরে ধীরে জোরালো হবে।")
+    mix_fade_out = st.slider("ফেড আউট (সেকেন্ড)", 0.0, 5.0, 2.0, step=0.5,
+                             key="mix_fade_out",
+                             help="শেষে মিক্সটি ধীরে ধীরে নীরব হবে।")
+    mix_duck = st.checkbox("কণ্ঠ চলার সময় মিউজিক হালকা করুন (ডাকিং)",
+                           value=True, key="mix_duck",
+                           help="চালু থাকলে কথা বলার সময় মিউজিক "
+                                "স্বয়ংক্রিয়ভাবে হালকা হয়, বিরতিতে আবার "
+                                "জোরালো হয়।")
+
+    # ---- ৩. মিক্স ও ডাউনলোড ----
+    st.subheader("৩. মিক্স করুন ও ডাউনলোড করুন")
+    result = st.session_state.get("last_result")
+    if result is None:
+        st.info("প্রথমে স্টুডিও ট্যাবে ভয়েস তৈরি করুন — তারপর এখানে মিক্স "
+                "করা যাবে।")
+    elif music is None:
+        st.info("প্রথমে উপরে মিউজিক বেছে নিন (আপলোড বা আবহ সঙ্গীত)।")
+    else:
+        if st.button("🎵 মিক্স করুন", type="primary",
+                     use_container_width=True):
+            try:
+                voice_arr, _sr = wav_bytes_to_samples(result["wav"])
+                mixed, info = mix_voice_music(
+                    voice_arr, music["samples"],
+                    voice_gain=float(mix_voice_vol),
+                    music_gain=float(mix_music_vol),
+                    balance=float(mix_balance) / 100.0,
+                    fade_in_sec=float(mix_fade_in),
+                    fade_out_sec=float(mix_fade_out),
+                    duck=bool(mix_duck))
+                try:
+                    mix_mp3 = mp3_bytes(mixed, 24000)
+                    mix_mp3_err = ""
+                except Exception as e:  # noqa: BLE001
+                    mix_mp3 = None
+                    mix_mp3_err = str(e)
+                st.session_state["music_mix"] = {
+                    "wav": wav_bytes(mixed, 24000), "mp3": mix_mp3,
+                    "mp3_error": mix_mp3_err, "info": info,
+                    "music_name": music["name"],
+                    "voice_duration_sec": result["duration_sec"],
+                }
+                st.rerun()
+            except Exception as e:  # noqa: BLE001
+                st.error(f"মিক্স করা যায়নি: {e}")
+
+    mix = st.session_state.get("music_mix")
+    if mix is not None and result is not None:
+        info = mix["info"]
+        st.header("🔊 মিক্স করা অডিও")
+        st.write(f"**মিউজিক:** {mix['music_name']} · "
+                 f"**সময়কাল:** {fmt_duration(info['duration_sec'])} · "
+                 f"**Peak:** {info['peak']} · **RMS:** {info['rms']}")
+        if info.get("attenuated"):
+            st.warning("মিক্সটি ক্লিপিং এড়াতে হালকা করা হয়েছে (peak ০.৮৯)।")
+        st.audio(mix["wav"], format="audio/wav")
+        d1, d2 = st.columns(2)
+        with d1:
+            st.download_button("⬇️ ভয়েস+মিউজিক WAV", data=mix["wav"],
+                               file_name="bangla_voice_music.wav",
+                               mime="audio/wav", use_container_width=True,
+                               key="mix_dl_wav")
+        with d2:
+            if mix["mp3"]:
+                st.download_button("⬇️ ভয়েস+মিউজিক MP3", data=mix["mp3"],
+                                   file_name="bangla_voice_music.mp3",
+                                   mime="audio/mpeg", use_container_width=True,
+                                   key="mix_dl_mp3")
+            else:
+                st.warning("মিক্সের MP3 তৈরি হয়নি"
+                           + (f" ({mix['mp3_error']})" if mix.get("mp3_error") else "")
+                           + " — WAV ডাউনলোড করুন।")
+        st.subheader("শুধু ভয়েস (মিউজিক ছাড়া)")
+        st.caption("একই ন্যারেশন — মিউজিক ছাড়া সংস্করণ।")
+        d3, d4 = st.columns(2)
+        with d3:
+            st.download_button("⬇️ শুধু ভয়েস WAV", data=result["wav"],
+                               file_name="bangla_voice_only.wav",
+                               mime="audio/wav", use_container_width=True,
+                               key="mix_dl_voice_wav")
+        with d4:
+            if result.get("mp3"):
+                st.download_button("⬇️ শুধু ভয়েস MP3", data=result["mp3"],
+                                   file_name="bangla_voice_only.mp3",
+                                   mime="audio/mpeg", use_container_width=True,
+                                   key="mix_dl_voice_mp3")
+            else:
+                st.caption("শুধু ভয়েসের MP3 নেই — WAV ডাউনলোড করুন।")
+
 # ============================================================ অ্যাডমিন ===
 with tab_admin:
     st.header("⚙️ অ্যাডমিন")
@@ -807,14 +1074,15 @@ with tab_admin:
                "ব্যবহারকারীর অ্যাপ। সব তথ্য এই সেশনের / এই সার্ভারের।")
 
     st.subheader("🧠 ইঞ্জিনের অবস্থা")
-    engine = get_engine("tiny")
-    info = engine.info()
-    st.write(f"**Indic Tiny TTS** — ✅ উপলব্ধ (CPU, ফ্রি) · "
-             f"কণ্ঠ: নারী + পুরুষ · নমুনা হার: {info.capabilities.get('sample_rate_hz', 24000)} Hz")
-    st.write("**Indic Parler-TTS** — ❌ অনুপলব্ধ — GPU প্রয়োজন, তাই এই "
-             "ফ্রি হোস্টে বন্ধ। (৬টি বাংলা কণ্ঠ + আসল আবেগ নিয়ন্ত্রণ।)")
-    st.write("**IndicF5 ভয়েস ক্লোনিং** — ❌ অনুপলব্ধ — GPU প্রয়োজন।")
-    st.write(f"**রাহাত — ন্যারেটর** — ⚠️ শুধু নমুনা; ক্লোনিং করা হয়নি।")
+    st.caption("ইঞ্জিন রেজিস্ট্রি (app.engines) থেকে — নতুন ইঞ্জিন "
+               "register_engine() দিয়ে যোগ করা যায়।")
+    for eng in list_engines():
+        mark = "✅ উপলব্ধ" if eng["available"] else "❌ অনুপলব্ধ"
+        voices = (" · কণ্ঠ: " + ", ".join(eng["voices"])) if eng["voices"] else ""
+        st.write(f"**{eng['name']}** — {mark}{voices}")
+        st.write(f"{eng['note']}" + ("" if eng["available"]
+                                      else f" {eng['reason']}"))
+    st.write("**রাহাত — ন্যারেটর** — ⚠️ শুধু নমুনা; ক্লোনিং করা হয়নি।")
 
     st.subheader("💻 সার্ভারের অবস্থা (লাইভ)")
     try:
@@ -838,6 +1106,7 @@ with tab_admin:
         st.caption("psutil নেই — সরল পরিমাপ দেখানো হচ্ছে।")
 
     st.subheader("📦 মডেলের তথ্য")
+    info = get_engine("tiny").info()
     st.write(f"**নাম:** {info.name}")
     st.write(f"**রিপো:** {info.repo}")
     st.write("**আকার:** ~৯০ MB · **নমুনা হার:** 24,000 Hz · "
@@ -872,7 +1141,7 @@ with tab_admin:
                "ডাউনলোডই স্থায়ী কপি।")
 
 st.divider()
-st.caption("BANGLA VOICE AI — Streamlit Cloud সংস্করণ v2 · ইঞ্জিন: Indic Tiny TTS "
+st.caption("BANGLA VOICE AI — Streamlit Cloud সংস্করণ v3 · ইঞ্জিন: Indic Tiny TTS "
            "(CC-BY-4.0) · GPU ইঞ্জিন (Parler / IndicF5) এই ফ্রি হোস্টে চলে না · "
            "অ্যাপটি নিষ্ক্রিয় থাকলে ঘুমিয়ে যায় — প্রথম খোলায় ~৩০–৬০ সেকেন্ড "
            "লাগতে পারে।")
