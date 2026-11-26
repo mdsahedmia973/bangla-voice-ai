@@ -1,4 +1,12 @@
-"""Engine registry — Streamlit build: TinyTTS ONLY (CPU, free).
+"""Engine registry — Streamlit build: Edge TTS (primary) + TinyTTS (fallback).
+
+Edge TTS is Microsoft's free read-aloud service via the edge-tts package —
+no API key, no GPU/CPU model to load. It was PROVEN on Streamlit Cloud
+(2026-11-26: minimal test app produced a real 3s MP3 with
+bn-BD-PradeepNeural). It is BLOCKED on the build VM (egress proxy mangles
+the WebSocket handshake), so live synthesis cannot be tested here — the
+mocked tests in tests/test_edge_engine.py cover everything else, and live
+verification must happen on Streamlit Cloud after deployment.
 
 Parler-TTS and IndicF5 need a GPU and are NEVER imported here — importing
 transformers would blow the 1 GB RAM budget and they cannot run on
@@ -11,9 +19,11 @@ returns every known engine (available or not) with its honest reason, so
 the Admin tab and Voice Library render from this one registry.
 """
 from .base import Engine
+from .edge import EdgeEngine
 from .tiny import TinyEngine
 
 ENGINES: dict[str, Engine] = {
+    "edge": EdgeEngine(),
     "tiny": TinyEngine(),
 }
 
@@ -80,5 +90,5 @@ def list_engines() -> list[dict]:
     return out
 
 
-__all__ = ["Engine", "TinyEngine", "ENGINES", "get_engine",
+__all__ = ["Engine", "EdgeEngine", "TinyEngine", "ENGINES", "get_engine",
            "register_engine", "list_engines", "UNAVAILABLE_ENGINES"]
