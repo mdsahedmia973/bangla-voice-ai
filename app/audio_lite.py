@@ -36,6 +36,58 @@ def merge_chunks(arrays: list[np.ndarray], gap_sec: float = 0.35,
     return np.ascontiguousarray(merged, dtype=np.float32)
 
 
+def join_with_gap(arrays: list[np.ndarray], gap_sec: float = 0.0,
+                  sr: int = SAMPLE_RATE) -> np.ndarray:
+    """Concatenate waveforms with a silence gap, WITHOUT any normalisation.
+
+    Used inside a chunk (between sentences) and between chunks before the
+    final merge — merge_chunks() does the single peak normalisation pass.
+    """
+    if not arrays:
+        return np.zeros(0, dtype=np.float32)
+    gap = np.zeros(int(sr * max(gap_sec, 0.0)), dtype=np.float32)
+    parts: list[np.ndarray] = []
+    for i, arr in enumerate(arrays):
+        parts.append(np.asarray(arr, dtype=np.float32).ravel())
+        if i < len(arrays) - 1 and gap.size:
+            parts.append(gap)
+    return np.ascontiguousarray(
+        np.concatenate(parts) if parts else np.zeros(0, dtype=np.float32),
+        dtype=np.float32)
+
+
+def waveform_png(samples: np.ndarray, sr: int = SAMPLE_RATE,
+                 width: int = 1000, height: int = 180) -> bytes:
+    """Draw the full audio as a waveform PNG (PIL only, no matplotlib).
+
+    Downsamples to one peak value per pixel column. Returns PNG bytes.
+    Pillow ships with Streamlit, so no new dependency is needed.
+    """
+    from PIL import Image, ImageDraw
+
+    arr = np.asarray(samples, dtype=np.float32)
+    bg = (15, 23, 42)       # deep navy (matches the dark theme)
+    grid = (71, 85, 105)    # slate
+    wave_col = (124, 108, 255)  # purple accent
+    img = Image.new("RGB", (width, height), bg)
+    draw = ImageDraw.Draw(img)
+    mid = height // 2
+    draw.line([(0, mid), (width, mid)], fill=grid, width=1)
+    if arr.size:
+        n = len(arr)
+        step = max(1, n // width)
+        cols = min(width, (n + step - 1) // step)
+        half = max(1, (height - 12) // 2)
+        for x in range(cols):
+            seg = arr[x * step:(x + 1) * step]
+            peak = float(np.abs(seg).max()) if seg.size else 0.0
+            h = max(1, int(peak * half))
+            draw.line([(x, mid - h), (x, mid + h)], fill=wave_col, width=1)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
 def wav_bytes(samples: np.ndarray, sr: int = SAMPLE_RATE) -> bytes:
     """Encode mono float32 samples (-1..1) as 16-bit PCM WAV bytes."""
     arr = np.asarray(samples, dtype=np.float32)
