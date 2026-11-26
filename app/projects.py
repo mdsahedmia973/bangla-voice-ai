@@ -27,6 +27,8 @@ OPTIONAL_FIELDS = {
     "speed": (int, float),
     "pause_sentence_sec": (int, float),
     "pause_chunk_sec": (int, float),
+    "pause_paragraph_sec": (int, float),
+    "voice_gain": (int, float),
     "auto_emotion": bool,
     "emo_overrides": dict,
 }
@@ -58,9 +60,11 @@ def validate_project_dict(d: object) -> tuple[dict | None, list[str]]:
             errors.append(f"'{f}'-এর ধরন ভুল।")
     if isinstance(d.get("speed"), (int, float)) and not 0.5 <= d["speed"] <= 1.5:
         errors.append("গতি ০.৫–১.৫ এর মধ্যে হতে হবে।")
-    for f in ("pause_sentence_sec", "pause_chunk_sec"):
+    for f in ("pause_sentence_sec", "pause_chunk_sec", "pause_paragraph_sec"):
         if isinstance(d.get(f), (int, float)) and not 0.0 <= d[f] <= 3.0:
             errors.append(f"'{f}' ০–৩ সেকেন্ডের মধ্যে হতে হবে।")
+    if isinstance(d.get("voice_gain"), (int, float)) and not 0.5 <= d["voice_gain"] <= 1.5:
+        errors.append("ভয়েস গেইন ০.৫–১.৫ এর মধ্যে হতে হবে।")
     if isinstance(d.get("emo_overrides"), dict):
         for k, v in d["emo_overrides"].items():
             if not isinstance(v, list) or any(t not in ALL_TAGS for t in v):
@@ -77,6 +81,8 @@ def validate_project_dict(d: object) -> tuple[dict | None, list[str]]:
         "speed": float(d.get("speed", 1.0)),
         "pause_sentence_sec": float(d.get("pause_sentence_sec", 0.3)),
         "pause_chunk_sec": float(d.get("pause_chunk_sec", 0.35)),
+        "pause_paragraph_sec": float(d.get("pause_paragraph_sec", 0.5)),
+        "voice_gain": float(d.get("voice_gain", 1.0)),
         "auto_emotion": bool(d.get("auto_emotion", True)),
         "emo_overrides": d.get("emo_overrides", {}),
         "created_at": d.get("created_at", _now()),

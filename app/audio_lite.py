@@ -16,18 +16,27 @@ SAMPLE_RATE = 24000
 
 def merge_chunks(arrays: list[np.ndarray], gap_sec: float = 0.35,
                  sr: int = SAMPLE_RATE,
-                 peak_target: float = 0.89) -> np.ndarray:
-    """Concatenate chunk waveforms with a silence gap between them, then
+                 peak_target: float = 0.89,
+                 gaps: list[float] | None = None) -> np.ndarray:
+    """Concatenate chunk waveforms with silence gaps between them, then
     peak-normalise (only attenuates when the peak exceeds the target —
-    quiet audio is left alone so QC can flag it honestly)."""
+    quiet audio is left alone so QC can flag it honestly).
+
+    `gaps` (optional) is a per-boundary gap list: gaps[i] is the silence
+    between chunk i and chunk i+1. When given it overrides `gap_sec`
+    (used by the generator so paragraph boundaries can use the longer
+    paragraph pause while in-paragraph chunk joins use the chunk pause).
+    """
     if not arrays:
         return np.zeros(0, dtype=np.float32)
-    gap = np.zeros(int(sr * max(gap_sec, 0.0)), dtype=np.float32)
     parts: list[np.ndarray] = []
     for i, arr in enumerate(arrays):
         parts.append(np.asarray(arr, dtype=np.float32).ravel())
-        if i < len(arrays) - 1 and gap.size:
-            parts.append(gap)
+        if i < len(arrays) - 1:
+            g = gaps[i] if gaps is not None else gap_sec
+            gap = np.zeros(int(sr * max(float(g), 0.0)), dtype=np.float32)
+            if gap.size:
+                parts.append(gap)
     merged = np.concatenate(parts) if parts else np.zeros(0, dtype=np.float32)
     if merged.size:
         peak = float(np.abs(merged).max())

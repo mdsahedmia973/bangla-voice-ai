@@ -28,27 +28,37 @@ def split_sentences(text: str) -> list[str]:
 
 
 def chunk_text(text: str, max_chars: int | None = None) -> list[dict]:
-    """Return [{index, text, emotions, source}] chunks.
+    """Return [{index, text, emotions, source, para_index, new_para}] chunks.
 
     Emotion tags written before a sentence (e.g. '[happy] আজ ...।') attach
     to that sentence's chunk. Paragraph breaks force a new chunk.
+    `para_index` counts paragraphs (0-based); `new_para` is True on the
+    first chunk of each paragraph — the generator uses it to apply the
+    paragraph pause (instead of the chunk pause) at those boundaries.
     """
     max_chars = max_chars or settings.max_chunk_chars
     chunks: list[dict] = []
+    para_index = -1  # শুধু খালি নয় এমন অনুচ্ছেদ গোনা হয়
 
     for para in text.split("\n"):
         para = para.strip()
         if not para:
             continue
+        para_index += 1
         pending_tags: list[str] = []
         cur = ""
         cur_tags: list[str] = []
+        first_in_para = True
 
         def flush():
-            nonlocal cur, cur_tags
+            nonlocal cur, cur_tags, first_in_para
             if cur.strip():
                 chunks.append({"index": len(chunks), "text": cur.strip(),
-                               "emotions": list(cur_tags), "source": "manual" if cur_tags else "auto"})
+                               "emotions": list(cur_tags),
+                               "source": "manual" if cur_tags else "auto",
+                               "para_index": para_index,
+                               "new_para": first_in_para})
+                first_in_para = False
             cur, cur_tags = "", []
 
         for sent in split_sentences(para):

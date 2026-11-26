@@ -34,6 +34,8 @@ def generate_audio(text: str, voice_id: str, base_speed: float,
                    preset: dict, progress_cb,
                    pause_sentence_sec: float = 0.3,
                    pause_chunk_sec: float | None = None,
+                   pause_paragraph_sec: float = 0.5,
+                   voice_gain: float = 1.0,
                    sentence_emotions: dict | None = None,
                    engine=None) -> dict:
     """Generate narration. Returns the result dict the UI renders.
@@ -41,6 +43,12 @@ def generate_audio(text: str, voice_id: str, base_speed: float,
     sentence_emotions: {normalized sentence text: [tags]} — manual [tags]
     in the script always win: a chunk that carries manual tags uses them;
     otherwise the sentence's chosen/auto emotions are used.
+
+    pause_paragraph_sec: real silence at paragraph boundaries (chunks
+    carry para_index, so a boundary between different paragraphs uses
+    this pause while in-paragraph chunk joins use pause_chunk_sec).
+    voice_gain: real gain on the finished audio (0.5–1.5); if the gain
+    would clip, it is capped at peak 0.98 and a warning is recorded.
     """
     if engine is None:
         from .engines import get_engine
@@ -56,6 +64,7 @@ def generate_audio(text: str, voice_id: str, base_speed: float,
     total_sents = sum(len(split_sentences(c["text"])) for c in chunks)
     done_sents = 0
     chunk_arrays: list[np.ndarray] = []
+    kept_chunks: list[dict] = []
     segments: list[dict] = []
     failed = 0
     failed_msgs: list[str] = []
@@ -90,6 +99,7 @@ def generate_audio(text: str, voice_id: str, base_speed: float,
         chunk_arr = join_with_gap(sent_arrays, gap_sec=pause_sentence_sec,
                                   sr=SAMPLE_RATE)
         chunk_arrays.append(chunk_arr)
+        kept_chunks.append(ch)
         segments.append({
             "index": len(segments),
             "text": ch["text"],
@@ -102,7 +112,26 @@ def generate_audio(text: str, voice_id: str, base_speed: float,
     if not chunk_arrays:
         raise RuntimeError("সব চাঙ্ক ব্যর্থ হয়েছে। "
                            + (" ".join(failed_msgs[:2]) if failed_msgs else ""))
-    merged = merge_chunks(chunk_arrays, gap_sec=pause_chunk_sec, sr=SAMPLE_RATE)
+    # Per-boundary gaps: paragraph boundaries get the paragraph pause,
+    # in-paragraph chunk joins get the chunk pause.
+    gaps = [
+        pause_paragraph_sec
+        if kept_chunks[i + 1].get("para_index", 0) != kept_chunks[i].get("para_index", 0)
+        else pause_chunk_sec
+        for i in range(len(chunk_arrays) - 1)
+    ]
+    merged = merge_chunks(chunk_arrays, gap_sec=pause_chunk_sec,
+                          sr=SAMPLE_RATE, gaps=gaps)
+    # Real voice gain, with a clipping guard (cap at peak 0.98 + warning).
+    gain_warnings: list[str] = []
+    voice_gain = float(max(0.5, min(1.5, voice_gain)))
+    if voice_gain != 1.0:
+        merged = (merged * voice_gain).astype(np.float32)
+        peak_after = float(np.abs(merged).max()) if merged.size else 0.0
+        if peak_after > 0.98:
+            merged = (merged * (0.98 / peak_after)).astype(np.float32)
+            gain_warnings.append(
+                "ভয়েস গেইন ক্লিপিং এড়াতে কমানো হয়েছে (peak ০.৯৮-এ সীমাবদ্ধ)।")
     total_sec = len(merged) / SAMPLE_RATE
     if (len(segments) <= SEGMENT_MP3_MAX_CHUNKS
             and total_sec <= SEGMENT_MP3_MAX_TOTAL_SEC):
@@ -126,7 +155,7 @@ def generate_audio(text: str, voice_id: str, base_speed: float,
         "duration_sec": total_sec,
         "chunks_total": len(chunks), "chunks_failed": failed,
         "failed_msgs": failed_msgs, "qc": qc,
-        "warnings": norm["warnings"],
+        "warnings": norm["warnings"] + gain_warnings,
         "voice_id": voice_id, "preset_id": preset["id"],
         "chars": norm["counts"]["chars"],
         "segments": segments,
@@ -137,5 +166,7 @@ def generate_audio(text: str, voice_id: str, base_speed: float,
         ),
         "pause_sentence_sec": pause_sentence_sec,
         "pause_chunk_sec": pause_chunk_sec,
+        "pause_paragraph_sec": pause_paragraph_sec,
+        "voice_gain": voice_gain,
         "created_at": datetime.now().strftime("%H:%M:%S"),
     }
