@@ -1,0 +1,13 @@
+# BANGLA VOICE AI — Streamlit Community Cloud সংস্করণ
+#
+# ইনস্টল: pip install -r requirements.txt
+# torch আসে PyTorch CPU ইনডেক্স থেকে (CUDA হুইল নয় — সেটি ~800MB+ এবং
+# Streamlit Cloud-এর 1 GB RAM-এ চলবে না)। --extra-index-url লাইনটি
+# requirements.txt-এর ভেতরেই থাকা জরুরি, নাহলে pip ভুল হুইল নেবে।
+--extra-index-url https://download.pytorch.org/whl/cpu
+streamlit==1.67.0
+torch==2.15.0+cpu
+numpy==2.5.5
+safetensors==0.8.0
+huggingface_hub==2.4.0
+lameenc==1.9.0
