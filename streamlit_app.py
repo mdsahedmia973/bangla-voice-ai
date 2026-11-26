@@ -1,22 +1,23 @@
-"""BANGLA VOICE AI — Streamlit Community Cloud সংস্করণ v3.
+"""BanglaVoice Studio — Streamlit Community Cloud সংস্করণ v4.
 
-v2-এর সব ফিচার অপরিবর্তিত + v3:
-- 🎵 মিউজিক স্টুডিও (নতুন ট্যাব): নিজের মিউজিক আপলোড (WAV/MP3) বা
-  অ্যাপে সিনথেসাইজ করা আবহ সঙ্গীত (প্যাড/ড্রোন/বৃষ্টি) — মিক্স, ফেড
-  ইন/আউট, ডাকিং, ভয়েস-মাত্র ও ভয়েস+মিউজিক এক্সপোর্ট (WAV/MP3)
-- ভয়েস কন্ট্রোল: গতি ০.৭৫–১.৫×, বাক্যের বিরতি, অনুচ্ছেদের বিরতি
-  (আসল), ভয়েস গেইন (ক্লিপিং-গার্ডসহ)
-- ভয়েস প্রোফাইল: আসল ২ কণ্ঠ + আসল সেটিংসের সমন্বয় (আলাদা কণ্ঠ নয়)
-- ব্রাউজার ভয়েস প্রিভিউ (ডিভাইসের SpeechSynthesis — শুধু শোনার জন্য)
-- ইঞ্জিন রেজিস্ট্রি (app.engines): নতুন ইঞ্জিন register_engine() দিয়ে
-  যোগ করা যায়; Parler/IndicF5 অনুপলব্ধ হিসেবে তালিকায় আছে
+প্রাথমিক ইঞ্জিন: Microsoft Edge TTS (bn-BD-PradeepNeural — বাংলাদেশি
+পুরুষ কণ্ঠ) — SSML rate/pitch/break নিয়ন্ত্রণসহ, ১১টি ডকুমেন্টারি ট্যাগ,
+দীর্ঘ স্ক্রিপ্ট, ব্যর্থ চাঙ্কের পুনঃচেষ্টা। ফলব্যাক: Indic Tiny TTS
+(২ কণ্ঠ, CPU)।
 
-ইঞ্জিন এখনো Indic Tiny TTS-ই (২ কণ্ঠ)। নতুন কোনো TTS ইঞ্জিন যোগ করা
-হয়নি — কণ্ঠের সিদ্ধান্ত এখনো খোলা। সীমা: ১ GB RAM, ffmpeg নেই,
-transformers নেই, পিচ/আবেগ নিয়ন্ত্রণ TinyTTS সমর্থন করে না।
+v2/v3-এর সব ফিচার অপরিবর্তিত: প্রজেক্ট, কাস্টম ভয়েস (নমুনা মাত্র),
+অ্যাডমিন, ওয়েভফর্ম, মিউজিক স্টুডিও, ব্রাউজার প্রিভিউ, স্বয়ংক্রিয়
+আবেগ, নরমালাইজেশন প্রিভিউ।
+
+সীমা: ১ GB RAM, ffmpeg নেই, transformers নেই। Edge TTS একটি নেটওয়ার্ক
+সার্ভিস — Microsoft-এর সার্ভিস বন্ধ থাকলে Tiny ফলব্যাক ব্যবহার করুন।
+Edge-এ আসল আবেগ নিয়ন্ত্রণ / আসল ফিসফিস নেই — ট্যাগগুলো SSML
+rate/pitch/break-এর আনুমানিক অনুবাদ (দেখুন app/ssml.py)।
 """
 import hashlib
 import json
+import sys
+import traceback
 from pathlib import Path
 
 import numpy as np
@@ -29,7 +30,8 @@ from app.config import settings
 from app.custom_voices import new_profile, profile_to_json, validate_sample
 from app.emotion import ALL_TAGS, TAG_BN, detect
 from app.engines import get_engine, list_engines
-from app.generate import generate_audio
+from app.engines.edge import EdgeTTSError
+from app.generate import generate_audio, retry_failed_chunks
 from app.music import (AMBIENCE_KINDS, decode_audio_bytes,
                        mix_voice_music, synthesize_ambience, validate_music)
 from app.presets import (PRESETS, VOICE_PROFILES, get_preset,
@@ -38,6 +40,7 @@ from app.projects import (delete_project, list_projects, load_project,
                           new_project_id, project_from_bytes,
                           project_to_bytes, projects_disk_usage,
                           rename_project, save_project)
+from app.ssml import EDGE_TAG_BN, EDGE_TAGS
 from app.textnorm import normalize
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -64,31 +67,93 @@ VOICE_OPTIONS = {
     "custom-rahat-narrator": "রাহাত — ন্যারেটর (নমুনা মাত্র, তৈরি করা যাবে না)",
 }
 
+EDGE_VOICE_OPTIONS = {
+    "edge-pradeep": "প্রদীপ — বাংলাদেশি পুরুষ (প্রাথমিক)",
+    "edge-nabanita": "নবনীতা — বাংলাদেশি নারী",
+    "edge-bashkar": "ভাস্কর — ভারতীয় বাংলা পুরুষ",
+    "edge-tanishaa": "তানিশা — ভারতীয় বাংলা নারী",
+}
+
+# গতি: নাম -> (SSML rate %, Tiny গতি গুণক)
+SPEED_LEVELS = {
+    "slow": ("ধীর", -25, 0.75),
+    "slightly-slow": ("একটু ধীর", -12, 0.88),
+    "normal": ("স্বাভাবিক", 0, 1.0),
+    "slightly-fast": ("একটু দ্রুত", +12, 1.12),
+    "fast": ("দ্রুত", +25, 1.25),
+}
+SPEED_LEVEL_IDS = list(SPEED_LEVELS)
+
+# পিচ: নাম -> SSML pitch % (Edge-এ প্রযোজ্য; Tiny পিচ সমর্থন করে না)
+PITCH_LEVELS = {
+    "lower": ("নিচু", -10),
+    "normal": ("স্বাভাবিক", 0),
+    "higher": ("উঁচু", +10),
+}
+PITCH_LEVEL_IDS = list(PITCH_LEVELS)
+
+ENGINE_OPTIONS = {
+    "edge": "Microsoft Edge TTS (প্রাথমিক — প্রাকৃতিক কণ্ঠ)",
+    "tiny": "Indic Tiny TTS (ফলব্যাক — CPU, অফলাইন-মতো)",
+}
+ENGINE_DEFAULT_VOICE = {"edge": "edge-pradeep", "tiny": "tiny-female"}
+
+
+def nearest_speed_level(speed_float: float) -> str:
+    """Preset/profile-এর গতি (float) -> সবচেয়ে কাছের নামকরা স্তর।"""
+    best, best_diff = "normal", 99.0
+    for lid, (_, _, mult) in SPEED_LEVELS.items():
+        d = abs(mult - float(speed_float))
+        if d < best_diff:
+            best, best_diff = lid, d
+    return best
+
+
+def speed_level_rate_pitch() -> tuple[int, int, float]:
+    """(SSML rate %, SSML pitch %, Tiny গতি গুণক) — বর্তমান সেটিংস থেকে।"""
+    lvl = SPEED_LEVELS.get(st.session_state.get("speed_level", "normal"),
+                           SPEED_LEVELS["normal"])
+    plvl = PITCH_LEVELS.get(st.session_state.get("pitch_level", "normal"),
+                            PITCH_LEVELS["normal"])
+    return lvl[1], plvl[1], lvl[2]
+
 SAMPLE_ONLY_MSG = ("এই কণ্ঠ শুধু নমুনা হিসেবে আছে — এতে ভয়েস তৈরি করা "
                    "যায় না। আসল ক্লোনিংয়ের জন্য IndicF5 ইঞ্জিন লাগে, যা "
                    "GPU ছাড়া এই ফ্রি হোস্টে চলে না। নারী বা পুরুষ কণ্ঠ "
                    "বেছে নিন।")
 
 
-@st.cache_resource(show_spinner=False)
-def get_tiny_engine():
-    """TinyTTS ইঞ্জিন — একবারই লোড হয়, সব রি-রানে একই অবজেক্ট থাকে।"""
-    return get_engine("tiny")
-
-
 def _on_preset_change():
     preset = get_preset(st.session_state.get("preset_id", "none"))
     st.session_state["speed"] = preset["speed"]
+    st.session_state["speed_level"] = nearest_speed_level(preset["speed"])
     st.session_state["pause_chunk_sec"] = preset["pause_sec"]
 
 
+def _on_engine_change():
+    """ইঞ্জিন বদলালে কণ্ঠও সেই ইঞ্জিনের ডিফল্ট কণ্ঠে ফিরবে।"""
+    eng = st.session_state.get("engine_id", "edge")
+    opts = current_voice_options()
+    if st.session_state.get("voice_id") not in opts:
+        st.session_state["voice_id"] = ENGINE_DEFAULT_VOICE.get(eng, "edge-pradeep")
+
+
 def _on_profile_change():
-    """Apply a voice profile: real voice + real settings (never a fake voice)."""
+    """Apply a voice profile: real voice + real settings (never a fake voice).
+
+    প্রোফাইলের কণ্ঠ অন্য ইঞ্জিনের হলে কণ্ঠ বদলানো হয় না — শুধু সেটিংস
+    (গতি, বিরতি, গেইন) প্রযোজ্য হয়; কণ্ঠ বর্তমান ইঞ্জিনেরই থাকে।
+    """
     prof = get_voice_profile(st.session_state.get("voice_profile_id", "none"))
     if prof["voice_id"]:
-        st.session_state["voice_id"] = prof["voice_id"]
+        eng = st.session_state.get("engine_id", "edge")
+        pv = prof["voice_id"]
+        if (eng == "edge" and pv.startswith("edge-")) or \
+           (eng == "tiny" and pv.startswith("tiny-")):
+            st.session_state["voice_id"] = pv
     if prof["speed"] is not None:
         st.session_state["speed"] = prof["speed"]
+        st.session_state["speed_level"] = nearest_speed_level(prof["speed"])
     if prof["pause_sentence_sec"] is not None:
         st.session_state["pause_sentence_sec"] = prof["pause_sentence_sec"]
     if prof["pause_chunk_sec"] is not None:
@@ -106,7 +171,11 @@ def fmt_duration(sec: float) -> str:
 def _init_state():
     defaults = {
         "history": [],
+        "engine_id": "edge",
+        "voice_id": "edge-pradeep",
         "speed": 1.0,
+        "speed_level": "normal",
+        "pitch_level": "normal",
         "pause_sentence_sec": 0.3,
         "pause_chunk_sec": 0.35,
         "pause_paragraph_sec": 0.5,
@@ -133,11 +202,22 @@ def _init_state():
 
 
 def current_voice_options() -> dict:
-    """Sidebar voice list: enabled built-ins + saved custom profiles."""
+    """Sidebar voice list for the SELECTED engine + saved custom profiles.
+
+    Edge ইঞ্জিনে Edge-এর ৪ কণ্ঠ, Tiny ইঞ্জিনে Tiny-এর ২ কণ্ঠ — অন্য
+    ইঞ্জিনের কণ্ঠ কখনো দেখানো হয় না, নীরবে বদলানোও হয় না। রাহাতের
+    নমুনা (শুধু শোনার জন্য) দুই ইঞ্জিনেই দেখানো হয়।
+    """
+    eng = st.session_state.get("engine_id", "edge")
     opts = {}
-    for vid in ("tiny-female", "tiny-male", "custom-rahat-narrator"):
-        if st.session_state.get(f"toggle_{vid}", True):
-            opts[vid] = VOICE_OPTIONS[vid]
+    if eng == "edge":
+        opts.update(EDGE_VOICE_OPTIONS)
+    else:
+        for vid in ("tiny-female", "tiny-male"):
+            if st.session_state.get(f"toggle_{vid}", True):
+                opts[vid] = VOICE_OPTIONS[vid]
+    if st.session_state.get("toggle_custom-rahat-narrator", True):
+        opts["custom-rahat-narrator"] = VOICE_OPTIONS["custom-rahat-narrator"]
     for p in st.session_state["custom_voices"]:
         opts[f"custom-{p['id']}"] = (
             f"🎙️ {p['name']} (নমুনা মাত্র, তৈরি করা যাবে না)")
@@ -152,12 +232,13 @@ def record_stats(result: dict):
     s["failed"] += result["chunks_failed"]
 
 
-def run_generation(text: str, voice_id: str, speed: float, preset: dict,
-                   pause_sentence_sec: float, pause_chunk_sec: float,
-                   pause_paragraph_sec: float, voice_gain: float,
-                   sentence_emotions: dict | None,
-                   progress_cb) -> dict:
+def run_generation(text: str, voice_id: str, engine_id: str, speed: float,
+                   preset: dict, pause_sentence_sec: float,
+                   pause_chunk_sec: float, pause_paragraph_sec: float,
+                   voice_gain: float, sentence_emotions: dict | None,
+                   progress_cb, rate_pct: int = 0, pitch_pct: int = 0) -> dict:
     """Generate + record stats + stash result. Raises on total failure."""
+    engine = get_engine(engine_id) or get_engine("tiny")
     result = generate_audio(
         text, voice_id, speed, preset, progress_cb,
         pause_sentence_sec=pause_sentence_sec,
@@ -165,7 +246,7 @@ def run_generation(text: str, voice_id: str, speed: float, preset: dict,
         pause_paragraph_sec=pause_paragraph_sec,
         voice_gain=voice_gain,
         sentence_emotions=sentence_emotions,
-        engine=get_tiny_engine())
+        engine=engine, rate_pct=rate_pct, pitch_pct=pitch_pct)
     record_stats(result)
     st.session_state["last_result"] = result
     pid = st.session_state.get("selected_project_id")
@@ -174,6 +255,7 @@ def run_generation(text: str, voice_id: str, speed: float, preset: dict,
     st.session_state["history"].insert(0, {
         "time": result["created_at"],
         "voice": current_voice_options().get(voice_id, voice_id).split(" — ")[0],
+        "engine": engine_id,
         "preset": preset["name"],
         "chars": result["chars"],
         "duration_sec": round(result["duration_sec"], 1),
@@ -184,33 +266,38 @@ def run_generation(text: str, voice_id: str, speed: float, preset: dict,
     return result
 
 
-def render_result(result: dict, key_prefix: str = "res"):
-    """Audio Studio: waveform + full playback + downloads + QC + segments."""
-    st.header("🔊 তৈরি অডিও")
+def run_retry(progress_cb) -> dict:
+    """Retry ONLY the failed chunks of the last result. Raises if none."""
+    result = st.session_state.get("last_result")
+    if not result:
+        raise ValueError("আগের কোনো ফলাফল নেই — নতুন করে তৈরি করুন।")
+    new_result = retry_failed_chunks(result, progress_cb)
+    record_stats(new_result)
+    st.session_state["last_result"] = new_result
+    pid = st.session_state.get("selected_project_id")
+    if pid:
+        st.session_state["project_audio"][pid] = new_result
+    return new_result
+
+
+def render_preview(result: dict, key_prefix: str = "res"):
+    """Audio Preview: waveform + playback + QC + per-segment players.
+
+    (Download buttons live in render_export() below — the Export Center.)
+    """
+    st.header("🔊 অডিও প্রিভিউ")
     if result.get("waveform_png"):
         st.image(result["waveform_png"], caption="ওয়েভফর্ম — সম্পূর্ণ অডিও",
                  use_container_width=True)
     st.audio(result["wav"], format="audio/wav")
+    eng_name = "Edge TTS" if result.get("job", {}).get("engine_id") == "edge" \
+        else "TinyTTS"
     st.write(f"**সময়কাল:** {fmt_duration(result['duration_sec'])} · "
              f"**চাঙ্ক:** {result['chunks_total'] - result['chunks_failed']}/"
              f"{result['chunks_total']} সফল · "
+             f"**ইঞ্জিন:** {eng_name} · "
              f"**কণ্ঠ:** {current_voice_options().get(result['voice_id'], result['voice_id']).split(' — ')[0]} · "
              f"**প্রিসেট:** {get_preset(result['preset_id'])['name']}")
-    dl1, dl2 = st.columns(2)
-    with dl1:
-        st.download_button("⬇️ WAV ডাউনলোড", data=result["wav"],
-                           file_name="bangla_voice.wav", mime="audio/wav",
-                           use_container_width=True, key=f"{key_prefix}_wav")
-    with dl2:
-        if result["mp3"]:
-            st.download_button("⬇️ MP3 ডাউনলোড", data=result["mp3"],
-                               file_name="bangla_voice.mp3",
-                               mime="audio/mpeg", use_container_width=True,
-                               key=f"{key_prefix}_mp3")
-        else:
-            st.warning("MP3 তৈরি হয়নি"
-                       + (f" ({result['mp3_error']})" if result["mp3_error"] else "")
-                       + " — WAV ডাউনলোড করুন।")
     qc = result["qc"]
     if qc["ok"]:
         st.success(f"QC পাস — RMS {qc['stats']['rms']}, peak {qc['stats']['peak']}, "
@@ -261,24 +348,67 @@ def render_result(result: dict, key_prefix: str = "res"):
                 st.write(f"**{s['index'] + 1}.** {s['text']}")
 
 
+def render_export(result: dict, key_prefix: str = "res"):
+    """Export Center: complete-narration downloads (WAV + MP3)."""
+    st.header("📥 এক্সপোর্ট সেন্টার")
+    st.caption("সম্পূর্ণ ন্যারেশন ডাউনলোড করুন — ফাইল তৈরি হলেই বোতাম "
+               "দেখা যাবে। মিউজিকসহ সংস্করণ মিউজিক স্টুডিও ট্যাবে।")
+    dl1, dl2 = st.columns(2)
+    with dl1:
+        st.download_button("⬇️ WAV ডাউনলোড", data=result["wav"],
+                           file_name="banglavoice_studio.wav", mime="audio/wav",
+                           use_container_width=True, key=f"{key_prefix}_wav")
+    with dl2:
+        if result["mp3"]:
+            st.download_button("⬇️ MP3 ডাউনলোড", data=result["mp3"],
+                               file_name="banglavoice_studio.mp3",
+                               mime="audio/mpeg", use_container_width=True,
+                               key=f"{key_prefix}_mp3")
+        else:
+            st.warning("MP3 তৈরি হয়নি"
+                       + (f" ({result['mp3_error']})" if result["mp3_error"] else "")
+                       + " — WAV ডাউনলোড করুন।")
+
+
+def render_result(result: dict, key_prefix: str = "res"):
+    """Backwards-compatible wrapper: preview + export together."""
+    render_preview(result, key_prefix)
+    render_export(result, key_prefix)
+
+
 # ------------------------------------------------------------------ app ---
 st.set_page_config(
-    page_title="বাংলা ভয়েস AI",
+    page_title="BanglaVoice Studio",
     page_icon="🎙️",
     layout="centered",
 )
 _init_state()
 
-st.title("🎙️ বাংলা ভয়েস AI")
-st.caption("The Ultimate Bengali AI Voice Studio — ফ্রি, সেলফ-হোস্টেড সংস্করণ "
-           "(Streamlit Cloud) · v3")
+st.title("🎙️ BanglaVoice Studio")
+st.caption("প্রাকৃতিক বাংলাদেশি বাংলা ন্যারেশন — প্রাথমিক ইঞ্জিন Microsoft "
+           "Edge TTS (প্রদীপ), ফলব্যাক Indic Tiny TTS · ফ্রি · v4")
 
 # ---------------------------------------------------------- সাইডবার ---
 with st.sidebar:
+    st.header("⚙️ ইঞ্জিন")
+    engine_id = st.radio(
+        "ইঞ্জিন", options=["edge", "tiny"],
+        format_func=lambda e: ENGINE_OPTIONS[e], key="engine_id",
+        on_change=_on_engine_change,
+        help="Edge TTS — Microsoft-এর ফ্রি read-aloud সার্ভিস, প্রাকৃতিক "
+             "নিউরাল কণ্ঠ (প্রাথমিক)। Tiny TTS — CPU-তে চলা ছোট মডেল, "
+             "ইন্টারনেট ছাড়াই কাজ করে (ফলব্যাক)।")
+    if engine_id == "edge":
+        st.caption("Edge TTS: ইন্টারনেট প্রয়োজন। Microsoft-এর সার্ভিস "
+                   "সাময়িকভাবে বন্ধ থাকলে Tiny ফলব্যাকে যান।")
+    else:
+        st.caption("Tiny TTS: শান্ত পাঠ-কণ্ঠ, আবেগ নিয়ন্ত্রণ নেই; গতি ও "
+                   "বিরতি দিয়েই টোনের ইঙ্গিত দেওয়া হয়।")
+
     st.header("কণ্ঠ নির্বাচন করুন")
     opts = current_voice_options()
     if st.session_state.get("voice_id") not in opts:
-        st.session_state["voice_id"] = "tiny-female" if "tiny-female" in opts else next(iter(opts))
+        st.session_state["voice_id"] = ENGINE_DEFAULT_VOICE.get(engine_id, "edge-pradeep")
     voice_id = st.radio(
         "ভয়েস", options=list(opts),
         format_func=lambda v: opts[v], key="voice_id")
@@ -329,10 +459,29 @@ with st.sidebar:
                    + " — বাক্যের আগে লিখলে টোনের ইঙ্গিত মিলবে।")
 
     st.header("ভয়েস সেটিংস")
-    speed = st.slider("গতি সমন্বয়", 0.75, 1.5, step=0.05, key="speed",
-                      help="কথা বলার গতি — ০.৭৫× ধীর, ১.৫× দ্রুত। "
-                           "প্রিসেট বা প্রোফাইল বদলালে এটি তাদের মানে ফিরে যায়।")
-    st.caption(f"কার্যকর গতি: {speed}×")
+    speed_level = st.selectbox(
+        "গতি", options=SPEED_LEVEL_IDS,
+        format_func=lambda lid: f"{SPEED_LEVELS[lid][0]} "
+                               f"({SPEED_LEVELS[lid][1]:+d}% / "
+                               f"{SPEED_LEVELS[lid][2]}×)",
+        key="speed_level",
+        help="কথা বলার গতি — Edge-এ SSML rate হিসেবে, Tiny-তে গতি গুণক "
+             "হিসেবে প্রযোজ্য। প্রিসেট বা প্রোফাইল বদলালে এটি তাদের মানে "
+             "ফিরে যায়।")
+    st.session_state["speed"] = SPEED_LEVELS[speed_level][2]
+    st.caption(f"কার্যকর গতি: {SPEED_LEVELS[speed_level][0]} "
+               f"({SPEED_LEVELS[speed_level][1]:+d}% / "
+               f"{SPEED_LEVELS[speed_level][2]}×)")
+    pitch_level = st.selectbox(
+        "পিচ", options=PITCH_LEVEL_IDS,
+        format_func=lambda lid: f"{PITCH_LEVELS[lid][0]} "
+                               f"({PITCH_LEVELS[lid][1]:+d}%)",
+        key="pitch_level",
+        help="কণ্ঠের উচ্চতা — Edge-এ SSML pitch হিসেবে প্রযোজ্য। "
+             "TinyTTS পিচ সমর্থন করে না, তাই Tiny ইঞ্জিনে এটি প্রযোজ্য "
+             "হবে না।")
+    if st.session_state.get("engine_id") == "tiny":
+        st.caption("পিচ — Edge ইঞ্জিনে প্রযোজ্য; TinyTTS পিচ সমর্থন করে না।")
     pause_sentence = st.slider(
         "বাক্যের মাঝে বিরতি (সেকেন্ড)", 0.0, 1.5, step=0.05,
         key="pause_sentence_sec",
@@ -356,25 +505,32 @@ with st.sidebar:
              "(সতর্কবার্তাসহ)।")
     if st.button("⚙️ সেটিংস ডিফল্টে ফেরান"):
         st.session_state["speed"] = 1.0
+        st.session_state["speed_level"] = "normal"
+        st.session_state["pitch_level"] = "normal"
         st.session_state["pause_sentence_sec"] = 0.3
         st.session_state["pause_chunk_sec"] = preset["pause_sec"]
         st.session_state["pause_paragraph_sec"] = 0.5
         st.session_state["voice_gain"] = 1.0
         st.session_state["voice_profile_id"] = "none"
         st.rerun()
-    st.caption("পিচ / আবেগের তীব্রতা — TinyTTS এগুলো সমর্থন করে না, তাই "
-               "এখানে দেখানো হয়নি। গতি ও বিরতি দিয়েই টোনের ইঙ্গিত দেওয়া হয়।")
+    st.caption("আবেগের তীব্রতা — কোনো ইঞ্জিনেই আসল আবেগ নিয়ন্ত্রণ নেই। "
+               "Edge-এ ট্যাগ SSML rate/pitch/break-এর আনুমানিক অনুবাদ; "
+               "Tiny-তে শুধু গতি ও বিরতি।")
 
     with st.expander("ℹ️ ইঞ্জিন সম্পর্কে (সত্য কথা)"):
-        st.write("**চলমান ইঞ্জিন:** Indic Tiny TTS (Bengali) — আসল নিউরাল "
-                 "মডেল, CPU-তে চলে, সম্পূর্ণ ফ্রি।")
-        st.write("**কণ্ঠ:** নারী + পুরুষ — ২টি আসল ভিন্ন কণ্ঠ।")
-        st.write("**সীমা:** TinyTTS একটি শান্ত পাঠ-কণ্ঠ। এতে আসল আবেগ "
-                 "(emotion) নিয়ন্ত্রণ নেই — [happy], [sad] এর মতো ট্যাগ "
-                 "পার্স করা হয়, মুছে ফেলা হয় না, তবে অডিওতে আবেগের "
-                 "পরিবর্তন আসবে না; শুধু গতি ও বিরতিতে সামান্য পরিবর্তন হবে।")
-        st.write("**লাইসেন্স:** CC-BY-4.0 (বাণিজ্যিক ব্যবহার করা যায়, "
-                 "ক্রেডিটসহ)।")
+        st.write("**প্রাথমিক ইঞ্জিন:** Microsoft Edge TTS — বাংলাদেশি "
+                 "নিউরাল কণ্ঠ (প্রদীপ, নবনীতা) ও ভারতীয় বাংলা কণ্ঠ "
+                 "(ভাস্কর, তানিশা)। ফ্রি, API key লাগে না।")
+        st.write("**সীমা:** Edge একটি নেটওয়ার্ক সার্ভিস — ইন্টারনেট "
+                 "প্রয়োজন; Microsoft-এর সার্ভিস বন্ধ থাকলে অডিও তৈরি "
+                 "হবে না (বাংলা ত্রুটি দেখাবে)। আসল আবেগ নিয়ন্ত্রণ / "
+                 "আসল ফিসফিস নেই — ট্যাগ SSML-এর আনুমানিক অনুবাদ।")
+        st.write("**ফলব্যাক ইঞ্জিন:** Indic Tiny TTS (Bengali) — আসল "
+                 "নিউরাল মডেল, CPU-তে চলে, সম্পূর্ণ ফ্রি। ২টি কণ্ঠ "
+                 "(নারী, পুরুষ)। শান্ত পাঠ-কণ্ঠ — আবেগ নিয়ন্ত্রণ নেই।")
+        st.write("**লাইসেন্স:** Tiny — CC-BY-4.0 (বাণিজ্যিক ব্যবহার করা "
+                 "যায়, ক্রেডিটসহ)। Edge — Microsoft-এর read-aloud "
+                 "সার্ভিসের শর্তাবলী প্রযোজ্য।")
 
     with st.expander("🔒 GPU ছাড়া চলবে না — তাই এখানে নেই"):
         st.write("**Indic Parler-TTS** (৬টি বাংলা কণ্ঠ — অর্জুন, অদিতি, "
@@ -386,14 +542,53 @@ with st.sidebar:
                  "অডিও শোনা যায়।")
 
 # ------------------------------------------------------------- ট্যাব ---
-tab_studio, tab_library, tab_custom, tab_projects, tab_music, tab_admin = st.tabs([
-    "🎙️ স্টুডিও", "🎤 ভয়েস লাইব্রেরি", "🎧 কাস্টম ভয়েস",
-    "📁 আমার প্রজেক্ট", "🎵 মিউজিক স্টুডিও", "⚙️ অ্যাডমিন",
+tab_dash, tab_studio, tab_library, tab_custom, tab_projects, tab_music, \
+    tab_admin, tab_help = st.tabs([
+    "📊 ড্যাশবোর্ড", "🎙️ ভয়েস স্টুডিও", "🎤 ভয়েস লাইব্রেরি",
+    "🎧 কাস্টম ভয়েস", "📁 আমার প্রজেক্ট", "🎵 মিউজিক স্টুডিও",
+    "⚙️ অ্যাডমিন", "❓ সাহায্য",
 ])
+
+# ========================================================== ড্যাশবোর্ড ===
+with tab_dash:
+    st.header("📊 ড্যাশবোর্ড")
+    st.caption("BanglaVoice Studio — এক নজরে অবস্থা।")
+    s = st.session_state["stats"]
+    d1, d2, d3, d4 = st.columns(4)
+    d1.metric("জেনারেশন (এই সেশন)", f"{s['jobs']}")
+    d2.metric("মোট অডিও", fmt_duration(s["audio_sec"]))
+    d3.metric("মোট চাঙ্ক", f"{s['chunks']}")
+    d4.metric("ব্যর্থ চাঙ্ক", f"{s['failed']}")
+
+    st.subheader("🧠 ইঞ্জিনের অবস্থা")
+    for eng in list_engines():
+        mark = "✅ উপলব্ধ" if eng["available"] else "❌ অনুপলব্ধ"
+        voices = (" · কণ্ঠ: " + ", ".join(eng["voices"])) if eng["voices"] else ""
+        primary = " (প্রাথমিক)" if eng["id"] == "edge" else \
+            (" (ফলব্যাক)" if eng["id"] == "tiny" else "")
+        st.write(f"**{eng['name']}**{primary} — {mark}{voices}")
+        st.caption(eng["note"] + ("" if eng["available"]
+                                   else f" {eng['reason']}"))
+    st.caption("বর্তমান ইঞ্জিন: "
+               f"{ENGINE_OPTIONS[st.session_state.get('engine_id', 'edge')]} · "
+               f"কণ্ঠ: {current_voice_options().get(st.session_state.get('voice_id'), '')}")
+
+    if st.session_state["history"]:
+        st.subheader("📜 এই সেশনের ইতিহাস")
+        st.caption("ইতিহাস শুধু এই সেশনে থাকে — পেজ রিফ্রেশ করলে মুছে যাবে। "
+                   "অডিও ডাউনলোড করে সংরক্ষণ করুন।")
+        for h in st.session_state["history"]:
+            st.write(f"• {h['time']} — {h['voice']} "
+                     f"({h.get('engine', '')}) · {h['preset']} · "
+                     f"{h['chars']:,} অক্ষর · {fmt_duration(h['duration_sec'])} · "
+                     f"চাঙ্ক {h['chunks']}")
+    else:
+        st.caption("এখনো কোনো ভয়েস তৈরি করা হয়নি — ভয়েস স্টুডিও ট্যাবে "
+                   "স্ক্রিপ্ট লিখে Generate চাপুন।")
 
 # ============================================================ স্টুডিও ===
 with tab_studio:
-    st.header("আপনার স্ক্রিপ্ট লিখুন")
+    st.header("📝 স্ক্রিপ্ট এডিটর")
 
     col_a, col_b = st.columns([1, 1])
     with col_a:
@@ -421,6 +616,10 @@ with tab_studio:
         m2.metric("শব্দ", f"{c['words']:,}")
         m3.metric("বাক্য", f"{c['sentences']:,}")
         m4.metric("আনুমানিক সময়", fmt_duration(norm["estimated_duration_sec"]))
+        if c["chars"] > 12000:
+            st.warning("স্ক্রিপ্টটি অনেক বড় — চাঙ্কে চাঙ্কে তৈরি হবে, কিছু "
+                       "সময় লাগতে পারে। পুরো স্ক্রিপ্ট প্রক্রিয়া করা হবে, "
+                       "কোনো অংশ চুপচাপ কাটা হবে না।")
         for w in norm["warnings"]:
             st.warning(w)
         chunks_preview = chunk_text(text)
@@ -478,8 +677,15 @@ with tab_studio:
             st.caption("স্বয়ংক্রিয় আবেগ বন্ধ — শুধু স্ক্রিপ্টের [ট্যাগ] "
                        "প্রযোজ্য হবে।")
         st.caption("উপলব্ধ ২৮টি ট্যাগ: " + ", ".join(f"[{t}]" for t in ALL_TAGS))
-        st.info("মনে রাখবেন: TinyTTS-এ ট্যাগ শুধু গতি ও বিরতি বদলায় — "
-                "আসল আবেগযুক্ত কণ্ঠ নয়।")
+        if st.session_state.get("engine_id") == "edge":
+            st.info("🎭 Edge ইঞ্জিনের ১১টি ডকুমেন্টারি ট্যাগ: "
+                    + ", ".join(f"[{t}]" for t in EDGE_TAGS)
+                    + " — এগুলো SSML rate/pitch/break-এর আনুমানিক অনুবাদ। "
+                    "আসল আবেগ নয়; [Whisper] আসল ফিসফিস নয় (ধীর + নিচু "
+                    "পিচের আনুমানিক রূপ)।")
+        else:
+            st.info("মনে রাখবেন: TinyTTS-এ ট্যাগ শুধু গতি ও বিরতি বদলায় — "
+                    "আসল আবেগযুক্ত কণ্ঠ নয়।")
 
     # -------------------------------------------------------- জেনারেট ---
     generate_clicked = st.button("🎙️ ভয়েস তৈরি করুন", type="primary",
@@ -490,51 +696,74 @@ with tab_studio:
         if voice_id == "custom-rahat-narrator" or voice_id.startswith("custom-"):
             st.error(SAMPLE_ONLY_MSG)
         else:
-            st.info("প্রথমবার মডেল ডাউনলোড ও লোড হতে ~১ মিনিট লাগতে পারে "
-                    "(মডেল ~৯০ MB)। পরের বার দ্রুত হবে।")
+            eng_now = st.session_state.get("engine_id", "edge")
+            if eng_now == "tiny":
+                st.info("প্রথমবার মডেল ডাউনলোড ও লোড হতে ~১ মিনিট লাগতে পারে "
+                        "(মডেল ~৯০ MB)। পরের বার দ্রুত হবে।")
+            else:
+                st.info("Edge TTS-এর মাধ্যমে অডিও তৈরি হচ্ছে — ইন্টারনেট "
+                        "প্রয়োজন। নেটওয়ার্ক ধীর হলে কিছু সময় লাগতে পারে।")
             bar = st.progress(0.0, text="শুরু হচ্ছে…")
             status = st.empty()
+            rate_pct, pitch_pct, _mult = speed_level_rate_pitch()
             try:
-                with st.spinner("মডেল লোড হচ্ছে / ভয়েস তৈরি হচ্ছে…"):
+                with st.spinner("ভয়েস তৈরি হচ্ছে…"):
                     run_generation(
-                        text, voice_id, speed, preset,
+                        text, voice_id, eng_now,
+                        st.session_state["speed"], preset,
                         st.session_state["pause_sentence_sec"],
                         st.session_state["pause_chunk_sec"],
                         st.session_state["pause_paragraph_sec"],
                         st.session_state["voice_gain"],
                         st.session_state.get("sentence_emotions") or None,
                         lambda f, msg: (bar.progress(f, text=msg),
-                                        status.write(msg)))
+                                        status.write(msg)),
+                        rate_pct=rate_pct, pitch_pct=pitch_pct)
                 bar.progress(1.0, text="সম্পন্ন হয়েছে ✅")
-            except Exception as e:  # noqa: BLE001 — ব্যবহারকারীকে সরল ভাষায় জানানো
+            except EdgeTTSError as e:
                 bar.empty()
-                st.error(f"ভয়েস তৈরি হয়নি: {e}")
+                st.error(e.user_message + " আবার চেষ্টা করুন — অথবা "
+                         "সাইডবার থেকে Tiny ফলব্যাক ইঞ্জিনে যান।")
+            except Exception:  # noqa: BLE001 — কাঁচা ত্রুটি ব্যবহারকারীকে নয়
+                traceback.print_exc(file=sys.stderr)
+                bar.empty()
+                st.error("ভয়েস তৈরি হয়নি — অপ্রত্যাশিত সমস্যা হয়েছে। "
+                         "আবার চেষ্টা করুন।")
 
     # ------------------------------------------- ব্রাউজার ভয়েস প্রিভিউ ---
     st.subheader("🔊 ব্রাউজার প্রিভিউ (শুধু শোনার জন্য)")
     st.caption("এটি আপনার ডিভাইসের (ফোন/কম্পিউটার) নিজের বাংলা ভয়েসে "
-               "শোনাবে — অ্যাপের আসল TinyTTS কণ্ঠ নয়, আর ডাউনলোড করা যায় "
+               "শোনাবে — অ্যাপের আসল কণ্ঠ নয়, আর ডাউনলোড করা যায় "
                "না। ডিভাইসে বাংলা ভয়েস না থাকলে কাজ করবে না। স্ক্রিপ্ট "
                "কেমন শোনাবে তার দ্রুত ধারণা নেওয়ার জন্য।")
     import streamlit.components.v1 as components  # noqa: PLC0415
     components.html(
-        browser_preview_html(text, rate=float(speed)),
+        browser_preview_html(text, rate=float(st.session_state["speed"])),
         height=150)
 
     # ----------------------------------------------------------- ফলাফল ---
     result = st.session_state.get("last_result")
     if result:
-        render_result(result, key_prefix="studio")
-
-    # ------------------------------------------------------------ ইতিহাস ---
-    if st.session_state["history"]:
-        st.header("📜 এই সেশনের ইতিহাস")
-        st.caption("ইতিহাস শুধু এই সেশনে থাকে — পেজ রিফ্রেশ করলে মুছে যাবে। "
-                   "অডিও ডাউনলোড করে সংরক্ষণ করুন।")
-        for h in st.session_state["history"]:
-            st.write(f"• {h['time']} — {h['voice']} · {h['preset']} · "
-                     f"{h['chars']:,} অক্ষর · {fmt_duration(h['duration_sec'])} · "
-                     f"চাঙ্ক {h['chunks']}")
+        render_preview(result, key_prefix="studio")
+        if result.get("failed_chunk_indices"):
+            n_failed = len(result["failed_chunk_indices"])
+            if st.button(f"🔁 ব্যর্থ চাঙ্ক আবার তৈরি করুন ({n_failed}টি)",
+                         type="secondary", use_container_width=True,
+                         key="retry_failed"):
+                bar = st.progress(0.0, text="ব্যর্থ চাঙ্ক আবার তৈরি হচ্ছে…")
+                try:
+                    with st.spinner("ব্যর্থ চাঙ্ক আবার তৈরি হচ্ছে…"):
+                        run_retry(lambda f, msg: bar.progress(f, text=msg))
+                    bar.progress(1.0, text="পুনঃচেষ্টা সম্পন্ন ✅")
+                    st.rerun()
+                except EdgeTTSError as e:
+                    bar.empty()
+                    st.error(e.user_message + " আবার চেষ্টা করুন।")
+                except Exception:  # noqa: BLE001
+                    traceback.print_exc(file=sys.stderr)
+                    bar.empty()
+                    st.error("পুনঃচেষ্টা করা যায়নি — আবার চেষ্টা করুন।")
+        render_export(result, key_prefix="studio")
 
 # ===================================================== ভয়েস লাইব্রেরি ===
 with tab_library:
@@ -543,6 +772,50 @@ with tab_library:
                "চলে না, সেগুলো অনুপলব্ধ বলে দেওয়া আছে।")
 
     st.subheader("✅ আসল কণ্ঠ — এখনই ব্যবহার করা যায়")
+    st.caption("প্রাথমিক ইঞ্জিন Microsoft Edge TTS — প্রাকৃতিক নিউরাল কণ্ঠ, "
+               "ফ্রি, API key লাগে না। ইন্টারনেট প্রয়োজন।")
+
+    edge_voices = [
+        {
+            "id": "edge-pradeep", "name": "প্রদীপ — বাংলাদেশি পুরুষ (প্রাথমিক)",
+            "desc": "বাংলাদেশি বাংলা পুরুষ কণ্ঠ — ডকুমেন্টারি ন্যারেশনের "
+                    "জন্য প্রাথমিক কণ্ঠ। Microsoft Edge Neural।",
+            "styles": "বর্ণনামূলক, ডকুমেন্টারি, বন্ধুত্বপূর্ণ",
+        },
+        {
+            "id": "edge-nabanita", "name": "নবনীতা — বাংলাদেশি নারী",
+            "desc": "বাংলাদেশি বাংলা নারী কণ্ঠ — ডকুমেন্টারি ও গল্পের জন্য।",
+            "styles": "বর্ণনামূলক, ডকুমেন্টারি",
+        },
+        {
+            "id": "edge-bashkar", "name": "ভাস্কর — ভারতীয় বাংলা পুরুষ",
+            "desc": "ভারতীয় বাংলা পুরুষ কণ্ঠ (bn-IN)।",
+            "styles": "বর্ণনামূলক",
+        },
+        {
+            "id": "edge-tanishaa", "name": "তানিশা — ভারতীয় বাংলা নারী",
+            "desc": "ভারতীয় বাংলা নারী কণ্ঠ (bn-IN)।",
+            "styles": "বর্ণনামূলক",
+        },
+    ]
+    for v in edge_voices:
+        with st.container(border=True):
+            st.subheader(v["name"])
+            st.write(v["desc"])
+            st.write(f"**স্টাইল:** {v['styles']}")
+            st.write("**আবেগ নিয়ন্ত্রণ:** আনুমানিক — ১১টি ডকুমেন্টারি ট্যাগ "
+                     "SSML rate/pitch/break-এ অনুবাদ করা হয়। আসল আবেগ / "
+                     "আসল ফিসফিস নয়।")
+            st.write("**ইঞ্জিন:** Microsoft Edge TTS (নেটওয়ার্ক সার্ভিস)।")
+            if st.button("এই কণ্ঠে তৈরি করুন", key=f"use_{v['id']}"):
+                st.session_state["engine_id"] = "edge"
+                st.session_state["voice_id"] = v["id"]
+                st.success("কণ্ঠ নির্বাচিত হয়েছে — ভয়েস স্টুডিও ট্যাবে গিয়ে "
+                           "Generate চাপুন।")
+                st.rerun()
+
+    st.subheader("✅ ফলব্যাক কণ্ঠ — Indic Tiny TTS (CPU)")
+    st.caption("ইন্টারনেট ছাড়াই চলে; শান্ত পাঠ-কণ্ঠ, আবেগ নিয়ন্ত্রণ নেই।")
     real_voices = [
         {
             "id": "tiny-female", "name": "নারী কণ্ঠ (Tiny Female)",
@@ -577,8 +850,9 @@ with tab_library:
                 st.caption("নমুনা ফাইল পাওয়া যায়নি।")
             if st.button("এই কণ্ঠে তৈরি করুন", key=f"use_{v['id']}"):
                 if st.session_state.get(f"toggle_{v['id']}", True):
+                    st.session_state["engine_id"] = "tiny"
                     st.session_state["voice_id"] = v["id"]
-                    st.success("কণ্ঠ নির্বাচিত হয়েছে — স্টুডিও ট্যাবে গিয়ে "
+                    st.success("কণ্ঠ নির্বাচিত হয়েছে — ভয়েস স্টুডিও ট্যাবে গিয়ে "
                                "Generate চাপুন।")
                     st.rerun()
                 else:
@@ -727,9 +1001,12 @@ with tab_projects:
             data = {
                 "name": proj_name.strip(),
                 "script": script_now,
-                "voice_id": st.session_state.get("voice_id", "tiny-female"),
+                "engine_id": st.session_state.get("engine_id", "edge"),
+                "voice_id": st.session_state.get("voice_id", "edge-pradeep"),
                 "preset_id": st.session_state.get("preset_id", "none"),
                 "speed": st.session_state.get("speed", 1.0),
+                "rate_pct": speed_level_rate_pitch()[0],
+                "pitch_pct": speed_level_rate_pitch()[1],
                 "pause_sentence_sec": st.session_state.get("pause_sentence_sec", 0.3),
                 "pause_chunk_sec": st.session_state.get("pause_chunk_sec", 0.35),
                 "pause_paragraph_sec": st.session_state.get("pause_paragraph_sec", 0.5),
@@ -788,9 +1065,14 @@ with tab_projects:
             with r1c1:
                 if st.button("📂 খুলুন", key=f"load_{pid}"):
                     st.session_state["script_text"] = p["script"]
+                    st.session_state["engine_id"] = p.get("engine_id", "edge")
                     st.session_state["voice_id"] = p["voice_id"]
                     st.session_state["preset_id"] = p["preset_id"]
                     st.session_state["speed"] = p["speed"]
+                    st.session_state["speed_level"] = nearest_speed_level(p["speed"])
+                    st.session_state["pitch_level"] = (
+                        "lower" if p.get("pitch_pct", 0) < 0
+                        else "higher" if p.get("pitch_pct", 0) > 0 else "normal")
                     st.session_state["pause_sentence_sec"] = p["pause_sentence_sec"]
                     st.session_state["pause_chunk_sec"] = p["pause_chunk_sec"]
                     st.session_state["pause_paragraph_sec"] = p.get("pause_paragraph_sec", 0.5)
@@ -810,20 +1092,28 @@ with tab_projects:
                         try:
                             with st.spinner("ভয়েস তৈরি হচ্ছে…"):
                                 run_generation(
-                                    p["script"], p["voice_id"], p["speed"],
+                                    p["script"], p["voice_id"],
+                                    p.get("engine_id", "edge"), p["speed"],
                                     get_preset(p["preset_id"]),
                                     p["pause_sentence_sec"],
                                     p["pause_chunk_sec"],
                                     p.get("pause_paragraph_sec", 0.5),
                                     p.get("voice_gain", 1.0),
                                     p.get("emo_overrides") or None,
-                                    lambda f, msg: bar.progress(f, text=msg))
+                                    lambda f, msg: bar.progress(f, text=msg),
+                                    rate_pct=p.get("rate_pct", 0),
+                                    pitch_pct=p.get("pitch_pct", 0))
                             st.session_state["selected_project_id"] = pid
                             bar.progress(1.0, text="সম্পন্ন হয়েছে ✅")
                             st.rerun()
-                        except Exception as e:  # noqa: BLE001
+                        except EdgeTTSError as e:
                             bar.empty()
-                            st.error(f"ভয়েস তৈরি হয়নি: {e}")
+                            st.error(e.user_message + " আবার চেষ্টা করুন — "
+                                     "অথবা Tiny ফলব্যাক ইঞ্জিনে যান।")
+                        except Exception:  # noqa: BLE001
+                            traceback.print_exc(file=sys.stderr)
+                            bar.empty()
+                            st.error("ভয়েস তৈরি হয়নি — আবার চেষ্টা করুন।")
             with r1c3:
                 st.download_button(
                     "⬇️ প্রজেক্ট ফাইল (.json)",
@@ -1106,8 +1396,16 @@ with tab_admin:
         st.caption("psutil নেই — সরল পরিমাপ দেখানো হচ্ছে।")
 
     st.subheader("📦 মডেলের তথ্য")
+    edge_info = get_engine("edge").info()
+    st.write(f"**প্রাথমিক — {edge_info.name}**")
+    st.write(f"**কণ্ঠ:** প্রদীপ (bn-BD পুরুষ), নবনীতা (bn-BD নারী), "
+             f"ভাস্কর (bn-IN পুরুষ), তানিশা (bn-IN নারী)")
+    st.write("**ধরন:** নেটওয়ার্ক সার্ভিস — কোনো মডেল ডাউনলোড হয় না; "
+             "ইন্টারনেট প্রয়োজন। **আবেগ:** SSML rate/pitch/break-এর "
+             "আনুমানিক অনুবাদ (আসল আবেগ নয়)।")
+    st.write(f"**লাইসেন্স:** {edge_info.license}")
     info = get_engine("tiny").info()
-    st.write(f"**নাম:** {info.name}")
+    st.write(f"**ফলব্যাক — {info.name}**")
     st.write(f"**রিপো:** {info.repo}")
     st.write("**আকার:** ~৯০ MB · **নমুনা হার:** 24,000 Hz · "
              "**কণ্ঠ:** ২টি (নারী, পুরুষ)")
@@ -1140,8 +1438,72 @@ with tab_admin:
     st.caption("অ্যাপ ঘুমিয়ে গেলে সার্ভারের ফাইল মুছে যায় — .json "
                "ডাউনলোডই স্থায়ী কপি।")
 
+# ============================================================ সাহায্য ===
+with tab_help:
+    st.header("❓ সাহায্য ও ডকুমেন্টেশন")
+    st.subheader("কীভাবে ব্যবহার করবেন")
+    st.write("১. **ভয়েস স্টুডিও** ট্যাবে বাংলা স্ক্রিপ্ট লিখুন বা পেস্ট করুন।")
+    st.write("২. সাইডবারে ইঞ্জিন বেছে নিন — Edge TTS (প্রাথমিক, প্রাকৃতিক "
+             "কণ্ঠ) বা Tiny TTS (ফলব্যাক)। কণ্ঠ বেছে নিন (প্রদীপ — "
+             "বাংলাদেশি পুরুষ, প্রাথমিক)।")
+    st.write("৩. গতি ও পিচ বেছে নিন, প্রয়োজনে ডকুমেন্টারি প্রিসেট বা "
+             "ভয়েস প্রোফাইল ব্যবহার করুন।")
+    st.write("৪. **🎙️ ভয়েস তৈরি করুন** চাপুন — অগ্রগতি দেখা যাবে। কোনো "
+             "চাঙ্ক ব্যর্থ হলে **🔁 ব্যর্থ চাঙ্ক আবার তৈরি করুন** বোতামে "
+             "শুধু সেই চাঙ্ক আবার তৈরি হবে।")
+    st.write("৫. **অডিও প্রিভিউ**-তে শুনুন, **এক্সপোর্ট সেন্টার** থেকে "
+             "WAV/MP3 ডাউনলোড করুন। মিউজিকসহ সংস্করণ **মিউজিক স্টুডিও** "
+             "ট্যাবে।")
+
+    st.subheader("🎭 ১১টি ডকুমেন্টারি ট্যাগ")
+    st.caption("বাক্যের আগে লিখুন, যেমন: [Deep] কল্পনা করুন… — ট্যাগগুলো "
+               "পড়া হয় না, SSML rate/pitch/break-এ অনুবাদ করা হয়। এগুলো "
+               "আনুমানিক অনুবাদ — আসল আবেগ নয়।")
+    for tag, vals in EDGE_TAGS.items():
+        desc = EDGE_TAG_BN.get(tag, tag)
+        parts = []
+        if "rate" in vals:
+            parts.append(f"গতি {vals['rate']:+d}%")
+        if "pitch" in vals:
+            parts.append(f"পিচ {vals['pitch']:+d}%")
+        if "break" in vals:
+            parts.append(f"বিরতি {vals['break']} সে")
+        st.write(f"**[{tag}]** {desc} — " + ", ".join(parts))
+    st.warning("[Whisper] আসল ফিসফিস নয় — ধীর গতি ও নিচু পিচের "
+               "আনুমানিক রূপ। Edge TTS-এ আসল ফিসফিস, হাসি বা কান্না "
+               "নেই।")
+
+    st.subheader("⚠️ সীমা (সত্য কথা)")
+    st.write("• **Edge TTS একটি নেটওয়ার্ক সার্ভিস** — ইন্টারনেট ছাড়া "
+             "কাজ করবে না। Microsoft-এর সার্ভিস সাময়িকভাবে বন্ধ থাকলে "
+             "বাংলা ত্রুটি দেখাবে; তখন Tiny ফলব্যাক ব্যবহার করুন।")
+    st.write("• **আসল আবেগ নিয়ন্ত্রণ নেই** — ট্যাগ শুধু গতি, পিচ ও "
+             "বিরতি বদলায়।")
+    st.write("• **প্রজেক্ট স্থায়ী নয়** — অ্যাপ ঘুমিয়ে গেলে সার্ভারের "
+             "ফাইল মুছে যায়; .json ডাউনলোডই স্থায়ী কপি।")
+    st.write("• **প্রথম Generate ধীর** — Tiny ইঞ্জিনে প্রথমবার মডেল "
+             "ডাউনলোড (~৯০ MB) হতে ~১ মিনিট লাগতে পারে।")
+    st.write("• **অ্যাপ ঘুমিয়ে যায়** — নিষ্ক্রিয় থাকলে Streamlit Cloud "
+             "অ্যাপটি ঘুম পাড়ায়; আবার খুলতে ~৩০–৬০ সেকেন্ড লাগতে পারে।")
+    st.write("• **GPU ইঞ্জিন নেই** — Parler-TTS (৬ কণ্ঠ, আসল আবেগ) ও "
+             "IndicF5 ক্লোনিং GPU ছাড়া এই ফ্রি হোস্টে চলে না।")
+
+    st.subheader("🔧 সমস্যা হলে")
+    st.write("• **“ইন্টারনেট সংযোগ পরীক্ষা করুন”** — নেটওয়ার্ক বা Edge "
+             "সার্ভিসের সমস্যা; একটু পরে আবার চেষ্টা করুন বা Tiny "
+             "ইঞ্জিনে যান।")
+    st.write("• **“অডিও তৈরি করা যায়নি”** — স্ক্রিপ্ট খালি কি না দেখুন; "
+             "খুব লম্বা স্ক্রিপ্ট ছোট ছোট অংশে ভাগ করে চেষ্টা করুন।")
+    st.write("• **“স্ক্রিপ্টটি অনেক বড়”** — সতর্কবার্তা মাত্র; পুরো "
+             "স্ক্রিপ্ট চাঙ্কে চাঙ্কে তৈরি হবে, কিছু সময় লাগবে।")
+    st.write("• **MP3 ডাউনলোড হচ্ছে না** — WAV ডাউনলোড করুন; দীর্ঘ "
+             "অডিওতে সেগমেন্ট MP3 বাদ যেতে পারে (RAM বাঁচাতে)।")
+    st.write("• **প্রজেক্ট হারিয়ে গেছে** — সার্ভারের ফাইল মুছে গেলে "
+             ".json ব্যাকআপ থেকে আপলোড করে ফিরিয়ে আনুন।")
+
 st.divider()
-st.caption("BANGLA VOICE AI — Streamlit Cloud সংস্করণ v3 · ইঞ্জিন: Indic Tiny TTS "
+st.caption("BanglaVoice Studio — Streamlit Cloud সংস্করণ v4 · প্রাথমিক ইঞ্জিন "
+           "Microsoft Edge TTS (API key ছাড়া, ফ্রি) · ফলব্যাক Indic Tiny TTS "
            "(CC-BY-4.0) · GPU ইঞ্জিন (Parler / IndicF5) এই ফ্রি হোস্টে চলে না · "
            "অ্যাপটি নিষ্ক্রিয় থাকলে ঘুমিয়ে যায় — প্রথম খোলায় ~৩০–৬০ সেকেন্ড "
            "লাগতে পারে।")
